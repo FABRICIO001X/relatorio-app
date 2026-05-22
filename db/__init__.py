@@ -1,0 +1,1 @@
+"""Cache local em SQLite."""

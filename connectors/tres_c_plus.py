@@ -70,6 +70,12 @@ class TresCPlusClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
     ) -> Any:
+        # TRAVA DE SEGURANÇA: este conector é READ-ONLY.
+        # Bloqueia explicitamente qualquer método que modifique dados.
+        if method.upper() != "GET":
+            raise TresCPlusError(
+                f"Operação {method} bloqueada. Conector é read-only por design."
+            )
         url = f"{self.base_url}/v1{path}"
         try:
             r = requests.request(
@@ -92,8 +98,9 @@ class TresCPlusClient:
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)
 
-    def _post(self, path: str, json: dict[str, Any] | None = None) -> Any:
-        return self._request("POST", path, json=json)
+    # Por segurança, este conector é READ-ONLY.
+    # Métodos POST/PUT/DELETE foram REMOVIDOS intencionalmente.
+    # NUNCA adicione _post/_put/_delete aqui sem revisão do usuário.
 
     # =============================================================
     # CHAMADAS  (src/v1/call.js)

@@ -85,9 +85,21 @@ def mostrar_erro_amigavel(titulo: str, erro: Exception):
 # Tabs
 # =============================================================
 st.title("Relatório consolidado")
-tab_visao, tab_3c, tab_exact, tab_sgcor = st.tabs(
-    ["📈 Visão geral", "📞 3C Plus", "🎯 Exact", "📑 SGCor"]
+tab_visao, tab_sdrs, tab_3c, tab_exact, tab_sgcor = st.tabs(
+    ["📈 Visão geral", "👥 SDRs", "📞 3C Plus", "🎯 Exact", "📑 SGCor"]
 )
+
+# -------------------------------------------------------------
+# SDRs (relatório customizado)
+# -------------------------------------------------------------
+with tab_sdrs:
+    from relatorios import sdr_performance
+    sdr_performance.renderizar(
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+        ttl_minutos=ttl,
+        usar_cache=usar_cache,
+    )
 
 # -------------------------------------------------------------
 # 3C PLUS

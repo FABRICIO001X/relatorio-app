@@ -98,6 +98,46 @@ def _coletar_leads_por_ids(
     return completos
 
 
+def _coletar_descartes_por_lead(
+    cliente: ExactClient,
+    lead_ids: set[int],
+    max_paginas: int = 30,
+    page_size: int = 500,
+) -> dict[int, dict]:
+    """
+    Pagina /Losts e devolve mapa {lead_id: {'stage': str, 'reason': str, 'date': str}}
+    apenas pros lead_ids passados.
+
+    Para cada lead, mantém o descarte MAIS RECENTE caso haja múltiplos
+    (improvável, mas teoricamente possível).
+    """
+    descartes: dict[int, dict] = {}
+    for i in range(max_paginas):
+        params = {
+            "$top": page_size,
+            "$skip": i * page_size,
+            "$orderby": "date desc",
+        }
+        resp = cliente._get("/Losts", params=params)
+        itens = resp.get("value", resp) if isinstance(resp, dict) else resp
+        if not itens:
+            break
+        for d in itens:
+            lid = d.get("leadId")
+            if lid in lead_ids and lid not in descartes:
+                descartes[lid] = {
+                    "stage": d.get("stage"),
+                    "reason": d.get("reason"),
+                    "date": d.get("date"),
+                }
+        if len(itens) < page_size:
+            break
+        # Se já temos todos os leads que nos interessam, podemos parar
+        if len(descartes) >= len(lead_ids):
+            break
+    return descartes
+
+
 # =============================================================
 # Processamento
 # =============================================================
@@ -105,15 +145,17 @@ def _construir_dataframe(
     transferencias: list[dict],
     leads_completos: dict[int, dict],
     sdrs_foco: dict[int, str],
+    descartes_por_lead: dict[int, dict] | None = None,
 ) -> pd.DataFrame:
     """
     Cada lead vira UMA linha. Coluna 'sdr_responsavel' é a SDR que fez a
     PRIMEIRA transferência desse lead dentro do período (ordenadas asc).
 
     `transferencias` vem desc, então invertemos pra pegar a mais antiga.
+    Se `descartes_por_lead` for passado, adiciona stage_descarte e motivo_descarte.
     """
-    # Ordenar asc por data, e pegar a primeira transferência de cada lead
-    # feita por uma das SDRs foco
+    descartes_por_lead = descartes_por_lead or {}
+
     transf_asc = sorted(transferencias, key=lambda t: t.get("createdAt") or "")
 
     primeira_por_lead: dict[int, dict] = {}
@@ -124,7 +166,7 @@ def _construir_dataframe(
         if t.get("originUserId") not in sdrs_foco:
             continue
         if lead_id in primeira_por_lead:
-            continue  # já temos a primeira (asc) - ignora outras
+            continue
         primeira_por_lead[lead_id] = t
 
     rows = []
@@ -132,10 +174,10 @@ def _construir_dataframe(
         sdr_nome = sdrs_foco[t["originUserId"]]
         lead = leads_completos.get(lead_id)
         if not lead:
-            # lead foi transferido mas não veio nos detalhes — pula
             continue
         sales = lead.get("salesRep") or {}
         source = lead.get("source") or {}
+        descarte = descartes_por_lead.get(lead_id) or {}
         rows.append({
             "lead_id": lead_id,
             "lead_nome": lead.get("lead"),
@@ -146,13 +188,14 @@ def _construir_dataframe(
             "data_cadastro": lead.get("registerDate"),
             "data_transferencia": t.get("createdAt"),
             "data_atualizacao": lead.get("updateDate"),
+            "stage_descarte": descarte.get("stage"),
+            "motivo_descarte": descarte.get("reason"),
         })
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df
 
-    # Conversão de tipos
     for col in ["data_cadastro", "data_transferencia", "data_atualizacao"]:
         df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
     df["dias_no_funil"] = (df["data_atualizacao"] - df["data_transferencia"]).dt.days
@@ -245,7 +288,16 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 st.error(f"Erro ao buscar leads: {e}")
                 return
 
-        df = _construir_dataframe(transf_filtradas, leads_completos, SDRS_FOCO)
+        with st.spinner("Buscando descartes (etapa onde lead foi perdido)..."):
+            try:
+                descartes_por_lead = _coletar_descartes_por_lead(cliente, set(lead_ids))
+            except ExactError as e:
+                st.warning(f"Não consegui buscar descartes (relatório vai funcionar sem essa parte): {e}")
+                descartes_por_lead = {}
+
+        df = _construir_dataframe(
+            transf_filtradas, leads_completos, SDRS_FOCO, descartes_por_lead
+        )
         cache.salvar_df(chave, df)
     else:
         # reconverter datas após vir do cache
@@ -317,6 +369,67 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.divider()
 
     # =========================================================
+    # GRÁFICO — etapa onde os leads foram descartados
+    # =========================================================
+    if "stage_descarte" in df.columns:
+        df_descartes = df[df["stage_descarte"].notna()].copy()
+        if not df_descartes.empty:
+            st.subheader("📉 Em qual etapa os leads foram descartados")
+            st.caption(
+                "Mostra em qual etapa do funil cada lead foi perdido. "
+                "Descartes em 'BDR' / 'TENTATIVA DE CONTATO' indicam leads pouco "
+                "qualificados. Descartes em 'PROPOSTA ENVIADA' indicam perdas "
+                "na negociação."
+            )
+
+            # Agrupar por SDR + etapa de descarte
+            grouped = (
+                df_descartes.groupby(["sdr_responsavel", "stage_descarte"])
+                .size()
+                .reset_index(name="Quantidade")
+                .rename(columns={
+                    "sdr_responsavel": "SDR",
+                    "stage_descarte": "Etapa do descarte",
+                })
+            )
+            fig_desc = px.bar(
+                grouped,
+                x="SDR",
+                y="Quantidade",
+                color="Etapa do descarte",
+                barmode="group",
+                title="Descartes por etapa do funil",
+                category_orders={
+                    "Etapa do descarte": [
+                        "BDR", "SEM CONTATO", "TENTATIVA DE CONTATO",
+                        "PROPOSTA ENVIADA", "NEGOCIO FECHADO",
+                    ],
+                },
+                color_discrete_map={
+                    "BDR": "#C8C8C8",
+                    "SEM CONTATO": "#9F9F9F",
+                    "TENTATIVA DE CONTATO": "#E5A663",
+                    "PROPOSTA ENVIADA": "#D85A30",
+                    "NEGOCIO FECHADO": "#7B3FB3",
+                },
+            )
+            st.plotly_chart(fig_desc, use_container_width=True)
+
+            # Top motivos de descarte
+            st.markdown("**Top motivos de descarte (todas as SDRs juntas)**")
+            motivos = (
+                df_descartes["motivo_descarte"]
+                .dropna()
+                .value_counts()
+                .head(10)
+                .reset_index()
+            )
+            motivos.columns = ["Motivo", "Quantidade"]
+            st.dataframe(motivos, use_container_width=True, hide_index=True)
+
+            st.divider()
+
+    # =========================================================
     # TABELA DETALHADA
     # =========================================================
     st.subheader("Detalhamento dos leads")
@@ -340,17 +453,28 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # Formatar pra exibição
     df_view = df_filtrado.copy()
     df_view["Transferência"] = df_view["data_transferencia"].dt.strftime("%d/%m/%Y")
-    df_view = df_view[[
+
+    colunas_view = [
         "Transferência", "lead_nome", "stage_atual", "sdr_responsavel",
-        "vendedor_atual", "origem", "dias_no_funil"
-    ]].rename(columns={
+        "vendedor_atual", "origem", "dias_no_funil",
+    ]
+    rename_map = {
         "lead_nome": "Lead",
         "stage_atual": "Status atual",
         "sdr_responsavel": "SDR (cadastrou)",
         "vendedor_atual": "Vendedor atual",
         "origem": "Origem",
         "dias_no_funil": "Dias",
-    }).sort_values("Transferência", ascending=False)
+    }
+    # Adicionar colunas de descarte se existirem
+    if "stage_descarte" in df_view.columns:
+        colunas_view.extend(["stage_descarte", "motivo_descarte"])
+        rename_map["stage_descarte"] = "Etapa do descarte"
+        rename_map["motivo_descarte"] = "Motivo descarte"
+
+    df_view = df_view[colunas_view].rename(columns=rename_map).sort_values(
+        "Transferência", ascending=False
+    )
 
     st.caption(f"{len(df_view)} leads filtrados")
     st.dataframe(df_view, use_container_width=True, hide_index=True)

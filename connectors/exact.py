@@ -51,6 +51,11 @@ class ExactClient:
         params: dict[str, Any] | None = None,
         json: dict[str, Any] | None = None,
     ) -> Any:
+        # TRAVA DE SEGURANÇA: este conector é READ-ONLY.
+        if method.upper() != "GET":
+            raise ExactError(
+                f"Operação {method} bloqueada. Conector é read-only por design."
+            )
         url = f"{self.base_url}{path}"
         try:
             r = requests.request(
@@ -73,8 +78,7 @@ class ExactClient:
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)
 
-    def _post(self, path: str, json: dict[str, Any] | None = None) -> Any:
-        return self._request("POST", path, json=json)
+    # READ-ONLY: métodos POST/PUT/DELETE removidos por seguranca.
 
     def _odata_params(
         self,

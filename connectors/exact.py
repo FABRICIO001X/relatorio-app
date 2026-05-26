@@ -57,23 +57,30 @@ class ExactClient:
                 f"Operação {method} bloqueada. Conector é read-only por design."
             )
         url = f"{self.base_url}{path}"
-        try:
-            r = requests.request(
-                method,
-                url,
-                headers=self._headers(),
-                params=params or {},
-                json=json,
-                timeout=30,
-            )
-            r.raise_for_status()
-            return r.json() if r.content else None
-        except requests.HTTPError as e:
-            raise ExactError(
-                f"HTTP {r.status_code} em {method} {path}: {r.text[:200]}"
-            ) from e
-        except requests.RequestException as e:
-            raise ExactError(f"Falha de rede em {path}: {e}") from e
+        # Tenta até 2 vezes em caso de timeout
+        ultimo_erro = None
+        for tentativa in range(2):
+            try:
+                r = requests.request(
+                    method,
+                    url,
+                    headers=self._headers(),
+                    params=params or {},
+                    json=json,
+                    timeout=90,
+                )
+                r.raise_for_status()
+                return r.json() if r.content else None
+            except requests.HTTPError as e:
+                raise ExactError(
+                    f"HTTP {r.status_code} em {method} {path}: {r.text[:200]}"
+                ) from e
+            except requests.exceptions.Timeout as e:
+                ultimo_erro = e
+                continue  # retry
+            except requests.RequestException as e:
+                raise ExactError(f"Falha de rede em {path}: {e}") from e
+        raise ExactError(f"Timeout em {path} após 2 tentativas: {ultimo_erro}")
 
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._request("GET", path, params=params)

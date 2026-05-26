@@ -202,8 +202,20 @@ def _construir_dataframe(
     return df
 
 
-def _calcular_metricas(df_sdr: pd.DataFrame) -> dict[str, Any]:
-    """Calcula métricas resumidas pra um SDR."""
+def _calcular_metricas(
+    df_sdr: pd.DataFrame,
+    data_inicio: date,
+    data_fim: date,
+) -> dict[str, Any]:
+    """
+    Calcula métricas resumidas pra um SDR.
+
+    REGRAS:
+    - Leads (total) = todas as transferências da SDR no período
+    - Em andamento = leads ainda em status inicial AGORA (independente da data)
+    - Propostas/Ganhos/Descartes = só conta os que MUDARAM PARA esse status
+      dentro do período (usa updateDate como proxy de quando virou aquele status)
+    """
     total = len(df_sdr)
     if total == 0:
         return {
@@ -215,12 +227,29 @@ def _calcular_metricas(df_sdr: pd.DataFrame) -> dict[str, Any]:
             "conversao_pct": 0.0,
             "dias_medio_ganho": None,
         }
+
+    # Em andamento = status atual ainda inicial
     em_andamento = df_sdr["stage_atual"].isin(STAGES_INICIAIS).sum()
-    propostas = (df_sdr["stage_atual"] == STAGE_PROPOSTA).sum()
-    ganhos = (df_sdr["stage_atual"] == STAGE_GANHO).sum()
-    descartes = (df_sdr["stage_atual"] == STAGE_DESCARTE).sum()
-    df_ganhos = df_sdr[df_sdr["stage_atual"] == STAGE_GANHO]
+
+    # Pra propostas/ganhos/descartes: filtrar pela data em que mudou de status
+    # Usamos updateDate como proxy (última modificação do lead)
+    di = pd.Timestamp(data_inicio).tz_localize("UTC")
+    df_fim = pd.Timestamp(data_fim).tz_localize("UTC") + pd.Timedelta(days=1)
+
+    em_status_no_periodo = (
+        (df_sdr["data_atualizacao"] >= di) & (df_sdr["data_atualizacao"] < df_fim)
+    )
+
+    propostas = ((df_sdr["stage_atual"] == STAGE_PROPOSTA) & em_status_no_periodo).sum()
+    ganhos = ((df_sdr["stage_atual"] == STAGE_GANHO) & em_status_no_periodo).sum()
+    descartes = ((df_sdr["stage_atual"] == STAGE_DESCARTE) & em_status_no_periodo).sum()
+
+    # Tempo médio até ganho (entre transferência e fechamento)
+    df_ganhos = df_sdr[
+        (df_sdr["stage_atual"] == STAGE_GANHO) & em_status_no_periodo
+    ]
     dias = df_ganhos["dias_no_funil"].mean() if not df_ganhos.empty else None
+
     return {
         "leads": int(total),
         "em_andamento": int(em_andamento),
@@ -243,13 +272,14 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     )
     with st.expander("ℹ️ Como o relatório conta os leads"):
         st.markdown(
-            "**Lógica:** um lead é considerado 'da SDR' quando ela faz a primeira "
-            "transferência dele pro vendedor dentro do período. Os números mostram "
-            "o **status atual** desses leads (que podem já estar com vendedores).\n\n"
-            "- **Em andamento:** leads ainda em fase inicial (BDR, Tentativa, Sem contato)\n"
-            "- **Propostas:** o vendedor enviou proposta\n"
-            "- **Ganhos:** virou venda fechada\n"
-            "- **Descartes:** lead foi descartado em alguma etapa"
+            "**Total de leads:** todas as transferências da SDR no período "
+            "(quando ela cadastrou e passou pro vendedor).\n\n"
+            "**Ganhos / Propostas / Descartes:** são contados pelo mês em que "
+            "o lead MUDOU para esse status (não pela data de transferência). "
+            "Ex: se a SDR transferiu em abril e o vendedor fechou em maio, "
+            "o ganho aparece no mês de **maio**.\n\n"
+            "**Em andamento:** leads ainda em status inicial agora "
+            "(BDR, Tentativa, Sem contato)."
         )
 
     try:
@@ -262,9 +292,15 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
-        with st.spinner("Coletando transferências do Exact..."):
+        # IMPORTANTE: pra contar ganhos/descartes do período corretamente, precisamos
+        # também de leads transferidos ANTES do período mas que fecharam dentro dele.
+        # Por isso buscamos transferências de até 90 dias antes da data_inicio.
+        from datetime import timedelta
+        di_busca = data_inicio - timedelta(days=90)
+
+        with st.spinner(f"Coletando transferências (desde {di_busca.strftime('%d/%m/%Y')})..."):
             try:
-                transferencias = _coletar_transferencias(cliente, data_inicio, data_fim)
+                transferencias = _coletar_transferencias(cliente, di_busca, data_fim)
             except ExactError as e:
                 st.error(f"Erro ao buscar transferências: {e}")
                 return
@@ -317,7 +353,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     cols = st.columns(3)
     for i, (sdr_id, nome) in enumerate(SDRS_FOCO.items()):
         df_sdr = df[df["sdr_responsavel"] == nome]
-        m = _calcular_metricas(df_sdr)
+        m = _calcular_metricas(df_sdr, data_inicio, data_fim)
         with cols[i]:
             st.markdown(f"#### {nome}")
             c1, c2 = st.columns(2)
@@ -342,7 +378,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     dados = []
     for sdr_id, nome in SDRS_FOCO.items():
         df_sdr = df[df["sdr_responsavel"] == nome]
-        m = _calcular_metricas(df_sdr)
+        m = _calcular_metricas(df_sdr, data_inicio, data_fim)
         dados.extend([
             {"SDR": nome, "Status": "Em andamento", "Quantidade": m["em_andamento"]},
             {"SDR": nome, "Status": "Propostas", "Quantidade": m["propostas"]},
@@ -454,9 +490,18 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     df_view = df_filtrado.copy()
     df_view["Transferência"] = df_view["data_transferencia"].dt.strftime("%d/%m/%Y")
 
+    # Data ganho/perda = data de atualização do lead (quando virou ganho/descarte)
+    # Só mostra se o status atual é Ganho ou Descartado
+    df_view["Data ganho/perda"] = df_view.apply(
+        lambda row: row["data_atualizacao"].strftime("%d/%m/%Y")
+        if pd.notna(row["data_atualizacao"]) and row["stage_atual"] in [STAGE_GANHO, STAGE_DESCARTE]
+        else "",
+        axis=1,
+    )
+
     colunas_view = [
-        "Transferência", "lead_nome", "stage_atual", "sdr_responsavel",
-        "vendedor_atual", "origem", "dias_no_funil",
+        "Transferência", "lead_nome", "stage_atual", "Data ganho/perda",
+        "sdr_responsavel", "vendedor_atual", "origem", "dias_no_funil",
     ]
     rename_map = {
         "lead_nome": "Lead",

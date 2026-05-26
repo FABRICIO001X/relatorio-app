@@ -230,7 +230,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v5:{data_inicio}:{data_fim}"
+    chave = f"sdr_v6:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -245,6 +245,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 return
 
         # === 2) Leads que viraram NEGOCIO FECHADO no período ===
+        # ÚNICA exceção: ganhos contam pelo updateDate, independente do registerDate
         with st.spinner("Buscando ganhos do período (independente da data de cadastro)..."):
             try:
                 leads_ganhos = _coletar_leads_filtrados(
@@ -256,32 +257,10 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 st.error(f"Erro ao buscar ganhos: {e}")
                 return
 
-        # === 3) Leads descartados no período ===
-        with st.spinner("Buscando descartes do período..."):
-            try:
-                leads_descartados = _coletar_leads_filtrados(
-                    cliente, data_inicio, data_fim,
-                    campo_data="updateDate",
-                    filtro_extra=f"stage eq '{STAGE_DESCARTE}'",
-                )
-            except ExactError as e:
-                st.error(f"Erro ao buscar descartes: {e}")
-                return
-
-        # === 4) Leads ATUALMENTE em PROPOSTA ENVIADA ===
-        with st.spinner("Buscando leads em proposta..."):
-            try:
-                leads_propostas = _coletar_leads_atuais_propostas(cliente)
-            except ExactError as e:
-                st.error(f"Erro ao buscar propostas: {e}")
-                return
-
         # === 5) Identificar SDR de cada lead via transferHistory ===
         todos_ids = set()
         todos_ids.update(l["id"] for l in leads_cadastrados)
         todos_ids.update(l["id"] for l in leads_ganhos)
-        todos_ids.update(l["id"] for l in leads_descartados)
-        todos_ids.update(l["id"] for l in leads_propostas)
 
         if not todos_ids:
             st.info("Nenhum lead no período.")
@@ -296,44 +275,44 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 st.error(f"Erro ao buscar transferências: {e}")
                 return
 
-        # === 6) Descartes (motivo + etapa) só pros descartados ===
-        ids_descartados = {l["id"] for l in leads_descartados}
+        # === 6) Descartes (motivo + etapa) só pros leads cadastrados que estão descartados
+        ids_cadastrados_descartados = {
+            l["id"] for l in leads_cadastrados if l.get("stage") == STAGE_DESCARTE
+        }
         with st.spinner("Buscando motivos de descarte..."):
             try:
-                descartes_info = _coletar_descartes_por_lead(cliente, ids_descartados)
+                descartes_info = _coletar_descartes_por_lead(cliente, ids_cadastrados_descartados)
             except ExactError as e:
                 st.warning(f"Não consegui buscar motivos: {e}")
                 descartes_info = {}
 
         # === 7) Montar DataFrame ===
+        # Após nova definição (v5), só precisamos de DUAS categorias no DataFrame:
+        # - 'cadastrado' (leads cadastrados no período) → contém info de status atual,
+        #   incluindo se estão em PROPOSTA ENVIADA, Descartado, etc.
+        # - 'ganho' (leads que mudaram pra NEGOCIO FECHADO no período, independente de cadastro)
+        # As métricas "Propostas enviadas" e "Descartados" são CALCULADAS a partir
+        # dos cadastrados, então não precisam de categoria própria.
         rows = []
+        ids_cadastrados = set()
         for lead in leads_cadastrados:
             sdr_id = primeira_sdr_por_lead.get(lead["id"])
             if sdr_id not in SDRS_FOCO:
                 continue
-            rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="cadastrado"))
+            # Anexar info de descarte (só relevante pra leads cadastrados descartados)
+            descarte = descartes_info.get(lead["id"])
+            rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], descarte=descarte, categoria="cadastrado"))
+            ids_cadastrados.add(lead["id"])
 
         for lead in leads_ganhos:
             sdr_id = primeira_sdr_por_lead.get(lead["id"])
             if sdr_id not in SDRS_FOCO:
                 continue
+            # Evita duplicar lead que já está como 'cadastrado' (caso ele tenha
+            # sido cadastrado E ganho no mesmo período)
+            if lead["id"] in ids_cadastrados:
+                continue
             rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="ganho"))
-
-        for lead in leads_descartados:
-            sdr_id = primeira_sdr_por_lead.get(lead["id"])
-            if sdr_id not in SDRS_FOCO:
-                continue
-            rows.append(_montar_linha(
-                lead, SDRS_FOCO[sdr_id],
-                descarte=descartes_info.get(lead["id"]),
-                categoria="descartado",
-            ))
-
-        for lead in leads_propostas:
-            sdr_id = primeira_sdr_por_lead.get(lead["id"])
-            if sdr_id not in SDRS_FOCO:
-                continue
-            rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="proposta"))
 
         df = pd.DataFrame(rows)
         if df.empty:
@@ -433,16 +412,10 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     # GRÁFICO — etapa de descarte (só leads cadastrados no período)
     # =========================================================
-    # Cruza categoria 'cadastrado' (que tem stage_atual = Descartado) com
-    # informação de etapa do descarte (que veio só na categoria 'descartado')
-    cadastrados_descartados_ids = set(
-        df[(df["categoria"] == "cadastrado") &
-           (df["stage_atual"] == STAGE_DESCARTE)]["lead_id"]
-    )
     df_desc = df[
-        (df["categoria"] == "descartado") &
-        df["stage_descarte"].notna() &
-        df["lead_id"].isin(cadastrados_descartados_ids)
+        (df["categoria"] == "cadastrado") &
+        (df["stage_atual"] == STAGE_DESCARTE) &
+        df["stage_descarte"].notna()
     ].drop_duplicates("lead_id")
     if not df_desc.empty:
         st.subheader("📉 Em qual etapa os leads foram descartados")
@@ -485,9 +458,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     cat_labels = {
         "cadastrado": "Cadastrado no período",
-        "ganho": "Ganho no período",
-        "descartado": "Descartado no período",
-        "proposta": "Em proposta agora",
+        "ganho": "Ganho no período (cadastrado fora)",
     }
     df_view = df.copy()
     df_view["Categoria"] = df_view["categoria"].map(cat_labels)
@@ -496,15 +467,15 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         "Filtrar por SDR", options=list(SDRS_FOCO.values()),
         default=list(SDRS_FOCO.values()),
     )
-    filtro_cat = st.multiselect(
-        "Filtrar por categoria",
-        options=list(cat_labels.values()),
-        default=list(cat_labels.values()),
+    filtro_status = st.multiselect(
+        "Filtrar por status atual",
+        options=sorted(df_view["stage_atual"].dropna().unique()),
+        default=sorted(df_view["stage_atual"].dropna().unique()),
     )
 
     df_filtrado = df_view[
         df_view["sdr_responsavel"].isin(filtro_sdr)
-        & df_view["Categoria"].isin(filtro_cat)
+        & df_view["stage_atual"].isin(filtro_status)
     ].copy()
 
     df_filtrado["Cadastro"] = df_filtrado["data_cadastro"].dt.strftime("%d/%m/%Y")

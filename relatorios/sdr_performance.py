@@ -83,7 +83,7 @@ def _coletar_transferencias(
 def _coletar_leads_por_ids(
     cliente: ExactClient,
     lead_ids: list[int],
-    lote_size: int = 50,
+    lote_size: int = 30,
 ) -> dict[int, dict]:
     """Busca leads completos por IDs em lotes usando operador OData 'in'."""
     completos: dict[int, dict] = {}

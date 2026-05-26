@@ -214,14 +214,14 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     )
     with st.expander("ℹ️ Como o relatório conta os leads"):
         st.markdown(
-            "- **Total de leads:** cadastrados no Spotter dentro do período (`registerDate`)\n"
-            "- **Em andamento:** leads do total acima que NÃO são ganho nem descarte\n"
-            "- **Propostas:** leads que AGORA estão com status 'PROPOSTA ENVIADA' "
-            "(independente da data)\n"
-            "- **Ganhos:** leads que fecharam venda no período (`updateDate`), "
+            "- **Total de leads:** cadastrados no Spotter dentro do período\n"
+            "- **Em andamento:** leads cadastrados no período que NÃO são ganho nem descarte\n"
+            "- **Propostas enviadas:** leads cadastrados no período que estão "
+            "atualmente com status 'PROPOSTA ENVIADA'\n"
+            "- **Ganhos:** leads que fecharam venda no período, "
             "**independente da data de cadastro** — pode ser lead de meses anteriores\n"
-            "- **Descartes:** leads descartados no período (`updateDate`), "
-            "**independente da data de cadastro**"
+            "- **Descartados:** leads cadastrados no período que estão "
+            "atualmente com status 'Descartado'"
         )
 
     try:
@@ -230,7 +230,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v4:{data_inicio}:{data_fim}"
+    chave = f"sdr_v5:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -360,7 +360,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     for i, (sdr_id, nome) in enumerate(SDRS_FOCO.items()):
         df_sdr = df[df["sdr_responsavel"] == nome]
 
-        # Total de leads = só categoria 'cadastrado' (deduplica)
+        # Total de leads = cadastrados no período (deduplica)
         df_cadastrados = df_sdr[df_sdr["categoria"] == "cadastrado"].drop_duplicates("lead_id")
         total_leads = len(df_cadastrados)
 
@@ -369,14 +369,14 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             [STAGE_GANHO, STAGE_DESCARTE]
         )).sum()
 
-        # Propostas = leads ATUAIS em proposta (categoria 'proposta')
-        propostas = len(df_sdr[df_sdr["categoria"] == "proposta"].drop_duplicates("lead_id"))
+        # Propostas enviadas = cadastrados no período com status atual = PROPOSTA ENVIADA
+        propostas = (df_cadastrados["stage_atual"] == STAGE_PROPOSTA).sum()
 
         # Ganhos = categoria 'ganho' (independente da data de cadastro)
         ganhos = len(df_sdr[df_sdr["categoria"] == "ganho"].drop_duplicates("lead_id"))
 
-        # Descartes = categoria 'descartado' (independente da data de cadastro)
-        descartes = len(df_sdr[df_sdr["categoria"] == "descartado"].drop_duplicates("lead_id"))
+        # Descartados = cadastrados no período com status atual = Descartado
+        descartes = (df_cadastrados["stage_atual"] == STAGE_DESCARTE).sum()
 
         # Conversão: ganhos / total cadastrados no período
         conversao = (ganhos / total_leads * 100) if total_leads > 0 else 0.0
@@ -387,10 +387,10 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             c1.metric("Total leads", total_leads)
             c2.metric("Em andamento", int(em_andamento))
             c3, c4 = st.columns(2)
-            c3.metric("Propostas", propostas)
+            c3.metric("Propostas enviadas", propostas)
             c4.metric("Ganhos ✅", ganhos)
             c5, c6 = st.columns(2)
-            c5.metric("Descartes ❌", descartes)
+            c5.metric("Descartados ❌", descartes)
             c6.metric("Conversão", f"{conversao:.1f}%")
 
     st.divider()
@@ -405,15 +405,15 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         em_andamento = (~df_cadastrados["stage_atual"].isin(
             [STAGE_GANHO, STAGE_DESCARTE]
         )).sum()
-        propostas = len(df_sdr[df_sdr["categoria"] == "proposta"].drop_duplicates("lead_id"))
+        propostas = (df_cadastrados["stage_atual"] == STAGE_PROPOSTA).sum()
         ganhos = len(df_sdr[df_sdr["categoria"] == "ganho"].drop_duplicates("lead_id"))
-        descartes = len(df_sdr[df_sdr["categoria"] == "descartado"].drop_duplicates("lead_id"))
+        descartes = (df_cadastrados["stage_atual"] == STAGE_DESCARTE).sum()
 
         dados.extend([
             {"SDR": nome, "Status": "Em andamento", "Quantidade": int(em_andamento)},
-            {"SDR": nome, "Status": "Propostas", "Quantidade": propostas},
+            {"SDR": nome, "Status": "Propostas enviadas", "Quantidade": int(propostas)},
             {"SDR": nome, "Status": "Ganhos", "Quantidade": ganhos},
-            {"SDR": nome, "Status": "Descartes", "Quantidade": descartes},
+            {"SDR": nome, "Status": "Descartados", "Quantidade": int(descartes)},
         ])
     df_g = pd.DataFrame(dados)
     fig = px.bar(
@@ -421,9 +421,9 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         title="Comparativo entre SDRs",
         color_discrete_map={
             "Em andamento": "#878787",
-            "Propostas": "#378ADD",
+            "Propostas enviadas": "#378ADD",
             "Ganhos": "#1D9E75",
-            "Descartes": "#D85A30",
+            "Descartados": "#D85A30",
         },
     )
     st.plotly_chart(fig, use_container_width=True)
@@ -431,13 +431,23 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.divider()
 
     # =========================================================
-    # GRÁFICO — etapa de descarte
+    # GRÁFICO — etapa de descarte (só leads cadastrados no período)
     # =========================================================
-    df_desc = df[(df["categoria"] == "descartado") & df["stage_descarte"].notna()].drop_duplicates("lead_id")
+    # Cruza categoria 'cadastrado' (que tem stage_atual = Descartado) com
+    # informação de etapa do descarte (que veio só na categoria 'descartado')
+    cadastrados_descartados_ids = set(
+        df[(df["categoria"] == "cadastrado") &
+           (df["stage_atual"] == STAGE_DESCARTE)]["lead_id"]
+    )
+    df_desc = df[
+        (df["categoria"] == "descartado") &
+        df["stage_descarte"].notna() &
+        df["lead_id"].isin(cadastrados_descartados_ids)
+    ].drop_duplicates("lead_id")
     if not df_desc.empty:
         st.subheader("📉 Em qual etapa os leads foram descartados")
         st.caption(
-            "Descartes no período (independente da data de cadastro). "
+            "Descartes apenas de leads cadastrados no período. "
             "Descartes em 'BDR' / 'TENTATIVA' = lead pouco qualificado. "
             "Descartes em 'PROPOSTA ENVIADA' = perda na negociação."
         )

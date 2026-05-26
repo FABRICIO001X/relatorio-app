@@ -43,6 +43,46 @@ STAGES_INICIAIS = {"BDR", "SEM CONTATO", "TENTATIVA DE CONTATO"}
 # =============================================================
 # Coleta de dados
 # =============================================================
+def _coletar_leads_cadastrados_periodo(
+    cliente: ExactClient,
+    data_inicio: date,
+    data_fim: date,
+    max_paginas: int = 30,
+    page_size: int = 500,
+) -> list[dict]:
+    """
+    Coleta leads cadastrados no período (filtrando por registerDate).
+    Pagina ordenando por registerDate desc até passar do período.
+    """
+    todos: list[dict] = []
+    di_iso = data_inicio.isoformat()
+    df_iso = data_fim.isoformat()
+    for i in range(max_paginas):
+        params = {
+            "$top": page_size,
+            "$skip": i * page_size,
+            "$orderby": "registerDate desc",
+        }
+        resp = cliente._get("/Leads", params=params)
+        itens = resp.get("value", resp) if isinstance(resp, dict) else resp
+        if not itens:
+            break
+        passou_periodo = False
+        for l in itens:
+            data_str = (l.get("registerDate") or "")[:10]
+            if data_str < di_iso:
+                passou_periodo = True
+                break
+            if data_str > df_iso:
+                continue
+            todos.append(l)
+        if passou_periodo:
+            break
+        if len(itens) < page_size:
+            break
+    return todos
+
+
 def _coletar_transferencias(
     cliente: ExactClient,
     data_inicio: date,
@@ -146,51 +186,88 @@ def _construir_dataframe(
     leads_completos: dict[int, dict],
     sdrs_foco: dict[int, str],
     descartes_por_lead: dict[int, dict] | None = None,
+    leads_cadastrados_periodo: list[dict] | None = None,
 ) -> pd.DataFrame:
     """
-    Cada lead vira UMA linha. Coluna 'sdr_responsavel' é a SDR que fez a
-    PRIMEIRA transferência desse lead dentro do período (ordenadas asc).
+    NOVA LÓGICA:
+    Cada lead cadastrado no período (leads_cadastrados_periodo) vira UMA linha.
+    A 'sdr_responsavel' vem da PRIMEIRA transferência feita por uma das SDRs foco
+    (em TODO o histórico, não só do período).
 
-    `transferencias` vem desc, então invertemos pra pegar a mais antiga.
-    Se `descartes_por_lead` for passado, adiciona stage_descarte e motivo_descarte.
+    Isso garante que:
+    - Leads são contados pelo registerDate (período de cadastro)
+    - O dono é a SDR original que cadastrou e transferiu (mesmo que tenha sido
+      transferida fora do período)
+
+    Se `leads_cadastrados_periodo` for None, cai no modo antigo (transferências).
     """
     descartes_por_lead = descartes_por_lead or {}
 
+    # Mapa: leadId -> primeira transferência feita por SDR foco
     transf_asc = sorted(transferencias, key=lambda t: t.get("createdAt") or "")
-
-    primeira_por_lead: dict[int, dict] = {}
+    primeira_transf_sdr: dict[int, dict] = {}
     for t in transf_asc:
         lead_id = t.get("leadId")
         if not lead_id:
             continue
         if t.get("originUserId") not in sdrs_foco:
             continue
-        if lead_id in primeira_por_lead:
+        if lead_id in primeira_transf_sdr:
             continue
-        primeira_por_lead[lead_id] = t
+        primeira_transf_sdr[lead_id] = t
 
     rows = []
-    for lead_id, t in primeira_por_lead.items():
-        sdr_nome = sdrs_foco[t["originUserId"]]
-        lead = leads_completos.get(lead_id)
-        if not lead:
-            continue
-        sales = lead.get("salesRep") or {}
-        source = lead.get("source") or {}
-        descarte = descartes_por_lead.get(lead_id) or {}
-        rows.append({
-            "lead_id": lead_id,
-            "lead_nome": lead.get("lead"),
-            "stage_atual": lead.get("stage"),
-            "sdr_responsavel": sdr_nome,
-            "vendedor_atual": sales.get("name") if sales.get("id") else None,
-            "origem": source.get("value"),
-            "data_cadastro": lead.get("registerDate"),
-            "data_transferencia": t.get("createdAt"),
-            "data_atualizacao": lead.get("updateDate"),
-            "stage_descarte": descarte.get("stage"),
-            "motivo_descarte": descarte.get("reason"),
-        })
+
+    if leads_cadastrados_periodo is not None:
+        # MODO NOVO: leads cadastrados no período como base
+        for lead in leads_cadastrados_periodo:
+            lead_id = lead.get("id")
+            t = primeira_transf_sdr.get(lead_id)
+            if not t:
+                # Lead cadastrado no período mas não foi transferido por nenhuma das 3 SDRs
+                continue
+            sdr_nome = sdrs_foco[t["originUserId"]]
+            # Sobrescreve com lead completo se tiver
+            lead_full = leads_completos.get(lead_id, lead)
+            sales = lead_full.get("salesRep") or {}
+            source = lead_full.get("source") or {}
+            descarte = descartes_por_lead.get(lead_id) or {}
+            rows.append({
+                "lead_id": lead_id,
+                "lead_nome": lead_full.get("lead"),
+                "stage_atual": lead_full.get("stage"),
+                "sdr_responsavel": sdr_nome,
+                "vendedor_atual": sales.get("name") if sales.get("id") else None,
+                "origem": source.get("value"),
+                "data_cadastro": lead_full.get("registerDate"),
+                "data_transferencia": t.get("createdAt"),
+                "data_atualizacao": lead_full.get("updateDate"),
+                "stage_descarte": descarte.get("stage"),
+                "motivo_descarte": descarte.get("reason"),
+            })
+    else:
+        # MODO ANTIGO: transferências como base (mantido por retrocompatibilidade)
+        for lead_id, t in primeira_transf_sdr.items():
+            sdr_nome = sdrs_foco[t["originUserId"]]
+            lead = leads_completos.get(lead_id)
+            if not lead:
+                continue
+            sales = lead.get("salesRep") or {}
+            source = lead.get("source") or {}
+            descarte = descartes_por_lead.get(lead_id) or {}
+            rows.append({
+                "lead_id": lead_id,
+                "lead_nome": lead.get("lead"),
+                "stage_atual": lead.get("stage"),
+                "sdr_responsavel": sdr_nome,
+                "vendedor_atual": sales.get("name") if sales.get("id") else None,
+                "origem": source.get("value"),
+                "data_cadastro": lead.get("registerDate"),
+                "data_transferencia": t.get("createdAt"),
+                "data_atualizacao": lead.get("updateDate"),
+                "stage_descarte": descarte.get("stage"),
+                "motivo_descarte": descarte.get("reason"),
+            })
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -272,12 +349,12 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     )
     with st.expander("ℹ️ Como o relatório conta os leads"):
         st.markdown(
-            "**Total de leads:** todas as transferências da SDR no período "
-            "(quando ela cadastrou e passou pro vendedor).\n\n"
-            "**Ganhos / Propostas / Descartes:** são contados pelo mês em que "
-            "o lead MUDOU para esse status (não pela data de transferência). "
-            "Ex: se a SDR transferiu em abril e o vendedor fechou em maio, "
-            "o ganho aparece no mês de **maio**.\n\n"
+            "**Total de leads:** leads CADASTRADOS no Spotter dentro do período "
+            "(data de criação do lead). A SDR responsável é quem fez a primeira "
+            "transferência pro vendedor.\n\n"
+            "**Ganhos / Propostas / Descartes:** contados pelo mês em que o lead "
+            "MUDOU para esse status. Ex: lead cadastrado em abril e fechado em maio "
+            "aparece em **Total de leads de abril** e em **Ganhos de maio**.\n\n"
             "**Em andamento:** leads ainda em status inicial agora "
             "(BDR, Tentativa, Sem contato)."
         )
@@ -288,51 +365,60 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v2:{data_inicio}:{data_fim}"
+    chave = f"sdr_v3:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
-        # IMPORTANTE: pra contar ganhos/descartes do período corretamente, precisamos
-        # também de leads transferidos ANTES do período mas que fecharam dentro dele.
-        # Por isso buscamos transferências de até 90 dias antes da data_inicio.
+        # NOVA LÓGICA:
+        # 1) Buscar leads CADASTRADOS no período (registerDate dentro do período)
+        # 2) Buscar transferências de todo histórico (sem filtro de data) pra
+        #    identificar a SDR que cadastrou cada lead
+        # 3) Cruzar tudo
+
+        with st.spinner(f"Buscando leads cadastrados de {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}..."):
+            try:
+                leads_periodo = _coletar_leads_cadastrados_periodo(
+                    cliente, data_inicio, data_fim
+                )
+            except ExactError as e:
+                st.error(f"Erro ao buscar leads: {e}")
+                return
+
+        if not leads_periodo:
+            st.info("Nenhum lead cadastrado no período.")
+            return
+
+        st.caption(f"Encontrados {len(leads_periodo)} leads cadastrados no período.")
+
+        # Buscar transferências (histórico amplo: 90 dias antes do início pra garantir)
         from datetime import timedelta
         di_busca = data_inicio - timedelta(days=90)
 
-        with st.spinner(f"Coletando transferências (desde {di_busca.strftime('%d/%m/%Y')})..."):
+        with st.spinner(f"Identificando SDR de cada lead (transferências desde {di_busca.strftime('%d/%m/%Y')})..."):
             try:
                 transferencias = _coletar_transferencias(cliente, di_busca, data_fim)
             except ExactError as e:
                 st.error(f"Erro ao buscar transferências: {e}")
                 return
 
-        # Filtrar pelos IDs das SDRs alvo
-        transf_filtradas = [
-            t for t in transferencias if t.get("originUserId") in SDRS_FOCO
-        ]
-        st.caption(f"Encontradas {len(transf_filtradas)} transferências das 3 SDRs no período.")
-
-        if not transf_filtradas:
-            st.info("Nenhuma transferência das 3 SDRs no período.")
-            return
-
-        lead_ids = list({t["leadId"] for t in transf_filtradas if t.get("leadId")})
-
-        with st.spinner(f"Buscando detalhes de {len(lead_ids)} leads..."):
-            try:
-                leads_completos = _coletar_leads_por_ids(cliente, lead_ids)
-            except ExactError as e:
-                st.error(f"Erro ao buscar leads: {e}")
-                return
+        # Lead completos: já temos os leads do período, mas precisamos garantir
+        # que temos o status atual atualizado (que já vem no /Leads, então OK)
+        leads_completos = {l["id"]: l for l in leads_periodo}
+        lead_ids_periodo = list(leads_completos.keys())
 
         with st.spinner("Buscando descartes (etapa onde lead foi perdido)..."):
             try:
-                descartes_por_lead = _coletar_descartes_por_lead(cliente, set(lead_ids))
+                descartes_por_lead = _coletar_descartes_por_lead(cliente, set(lead_ids_periodo))
             except ExactError as e:
-                st.warning(f"Não consegui buscar descartes (relatório vai funcionar sem essa parte): {e}")
+                st.warning(f"Não consegui buscar descartes: {e}")
                 descartes_por_lead = {}
 
         df = _construir_dataframe(
-            transf_filtradas, leads_completos, SDRS_FOCO, descartes_por_lead
+            transferencias,
+            leads_completos,
+            SDRS_FOCO,
+            descartes_por_lead,
+            leads_cadastrados_periodo=leads_periodo,
         )
         cache.salvar_df(chave, df)
     else:

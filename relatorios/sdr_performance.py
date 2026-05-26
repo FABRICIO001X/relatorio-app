@@ -1,21 +1,21 @@
 """
 Relatório de performance dos SDRs no Exact Spotter.
 
-LÓGICA CORRETA (validada com dados reais em 25/05/2026):
-- Um lead é "da SDR X" quando X foi quem transferiu o lead pro vendedor
-  (a primeira transferência feita por X dentro do período).
-- Isso resolve o problema de o campo `sdr` do lead mudar quando passa
-  pro vendedor — perdemos rastreabilidade se filtrássemos só por `sdr`.
+CRITÉRIOS (definidos com usuário em 25/05/2026):
+- Total de leads = leads CADASTRADOS no período (registerDate)
+- Em andamento = leads cadastrados no período que NÃO são ganho nem descarte
+- Propostas = leads que AGORA estão com status 'PROPOSTA ENVIADA' (sem filtro de data)
+- Ganhos = leads que mudaram pra 'NEGOCIO FECHADO' no período (updateDate),
+           INDEPENDENTE de quando foram cadastrados
+- Descartes = leads que mudaram pra 'Descartado' no período (updateDate),
+              INDEPENDENTE de quando foram cadastrados
 
-Fonte: GET /v3/transferHistory  (originUserId = quem transferiu)
-       GET /v3/Leads?$filter=id in (...)  (stage atual + dados do lead)
-
-Foco: IASMIM (436128), CRISLANE (442056), JENNYFER (448464)
-Funil: 23120 (único)
+SDR responsável de cada lead: quem fez a primeira transferência (originUserId em transferHistory)
+Foco: IASMIM (436128), CRISLANE (442056), JENNYFER (448464) | Funil 23120
 """
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import pandas as pd
@@ -25,51 +25,50 @@ import streamlit as st
 from connectors.exact import ExactClient, ExactError
 from db import cache
 
-# =============================================================
-# Configuração
-# =============================================================
 SDRS_FOCO = {
     436128: "IASMIM",
     442056: "CRISLANE",
     448464: "JENNYFER",
 }
 
-# Stages reais do funil 23120
 STAGE_PROPOSTA = "PROPOSTA ENVIADA"
 STAGE_GANHO = "NEGOCIO FECHADO"
 STAGE_DESCARTE = "Descartado"
-STAGES_INICIAIS = {"BDR", "SEM CONTATO", "TENTATIVA DE CONTATO"}
+
 
 # =============================================================
 # Coleta de dados
 # =============================================================
-def _coletar_leads_cadastrados_periodo(
+def _coletar_leads_filtrados(
     cliente: ExactClient,
     data_inicio: date,
     data_fim: date,
+    campo_data: str = "registerDate",
+    filtro_extra: str | None = None,
     max_paginas: int = 30,
     page_size: int = 500,
 ) -> list[dict]:
     """
-    Coleta leads cadastrados no período (filtrando por registerDate).
-    Pagina ordenando por registerDate desc até passar do período.
+    Coleta leads filtrando por campo de data (registerDate ou updateDate).
+    Pagina ordenando desc até passar do período.
     """
     todos: list[dict] = []
     di_iso = data_inicio.isoformat()
     df_iso = data_fim.isoformat()
+
+    params_base = {"$orderby": f"{campo_data} desc"}
+    if filtro_extra:
+        params_base["$filter"] = filtro_extra
+
     for i in range(max_paginas):
-        params = {
-            "$top": page_size,
-            "$skip": i * page_size,
-            "$orderby": "registerDate desc",
-        }
+        params = {**params_base, "$top": page_size, "$skip": i * page_size}
         resp = cliente._get("/Leads", params=params)
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
         if not itens:
             break
         passou_periodo = False
         for l in itens:
-            data_str = (l.get("registerDate") or "")[:10]
+            data_str = (l.get(campo_data) or "")[:10]
             if data_str < di_iso:
                 passou_periodo = True
                 break
@@ -83,59 +82,64 @@ def _coletar_leads_cadastrados_periodo(
     return todos
 
 
-def _coletar_transferencias(
+def _coletar_leads_atuais_propostas(
     cliente: ExactClient,
-    data_inicio: date,
-    data_fim: date,
-    max_paginas: int = 30,
+    max_paginas: int = 20,
     page_size: int = 500,
 ) -> list[dict]:
-    """Coleta todas as transferências do período, ordenadas mais recente primeiro."""
+    """Coleta TODOS os leads atualmente com status PROPOSTA ENVIADA (sem filtro de data)."""
     todos: list[dict] = []
-    di_iso = data_inicio.isoformat()
-    df_iso = data_fim.isoformat()
     for i in range(max_paginas):
         params = {
             "$top": page_size,
             "$skip": i * page_size,
-            "$orderby": "createdAt desc",
+            "$filter": f"stage eq '{STAGE_PROPOSTA}'",
         }
-        resp = cliente._get("/transferHistory", params=params)
+        resp = cliente._get("/Leads", params=params)
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
         if not itens:
             break
-        passou_periodo = False
-        for t in itens:
-            data_str = (t.get("createdAt") or "")[:10]
-            if data_str < di_iso:
-                passou_periodo = True
-                break
-            if data_str > df_iso:
-                continue
-            todos.append(t)
-        if passou_periodo:
-            break
+        todos.extend(itens)
         if len(itens) < page_size:
             break
     return todos
 
 
-def _coletar_leads_por_ids(
+def _coletar_transferencias_dos_leads(
     cliente: ExactClient,
-    lead_ids: list[int],
-    lote_size: int = 30,
-) -> dict[int, dict]:
-    """Busca leads completos por IDs em lotes usando operador OData 'in'."""
-    completos: dict[int, dict] = {}
-    for i in range(0, len(lead_ids), lote_size):
-        lote = lead_ids[i : i + lote_size]
-        ids_str = ",".join(str(x) for x in lote)
-        params = {"$filter": f"id in ({ids_str})", "$top": lote_size}
-        resp = cliente._get("/Leads", params=params)
+    lead_ids: set[int],
+    max_paginas: int = 50,
+    page_size: int = 500,
+) -> dict[int, int]:
+    """
+    Pagina transferHistory inteiro e retorna mapa {lead_id: sdr_id da primeira SDR foco}.
+    Itera asc pra pegar a PRIMEIRA transferência feita por uma SDR foco.
+    """
+    primeira_sdr: dict[int, int] = {}
+    sdr_ids = set(SDRS_FOCO.keys())
+
+    for i in range(max_paginas):
+        params = {
+            "$top": page_size,
+            "$skip": i * page_size,
+            "$orderby": "createdAt asc",
+        }
+        resp = cliente._get("/transferHistory", params=params)
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
-        for l in itens or []:
-            completos[l["id"]] = l
-    return completos
+        if not itens:
+            break
+        for t in itens:
+            lid = t.get("leadId")
+            if lid not in lead_ids:
+                continue
+            origin = t.get("originUserId")
+            if origin in sdr_ids and lid not in primeira_sdr:
+                primeira_sdr[lid] = origin
+        if len(itens) < page_size:
+            break
+        if len(primeira_sdr) >= len(lead_ids):
+            break
+    return primeira_sdr
 
 
 def _coletar_descartes_por_lead(
@@ -144,13 +148,7 @@ def _coletar_descartes_por_lead(
     max_paginas: int = 30,
     page_size: int = 500,
 ) -> dict[int, dict]:
-    """
-    Pagina /Losts e devolve mapa {lead_id: {'stage': str, 'reason': str, 'date': str}}
-    apenas pros lead_ids passados.
-
-    Para cada lead, mantém o descarte MAIS RECENTE caso haja múltiplos
-    (improvável, mas teoricamente possível).
-    """
+    """Mapa {lead_id: {stage, reason, date}} pros leads passados."""
     descartes: dict[int, dict] = {}
     for i in range(max_paginas):
         params = {
@@ -172,7 +170,6 @@ def _coletar_descartes_por_lead(
                 }
         if len(itens) < page_size:
             break
-        # Se já temos todos os leads que nos interessam, podemos parar
         if len(descartes) >= len(lead_ids):
             break
     return descartes
@@ -181,160 +178,28 @@ def _coletar_descartes_por_lead(
 # =============================================================
 # Processamento
 # =============================================================
-def _construir_dataframe(
-    transferencias: list[dict],
-    leads_completos: dict[int, dict],
-    sdrs_foco: dict[int, str],
-    descartes_por_lead: dict[int, dict] | None = None,
-    leads_cadastrados_periodo: list[dict] | None = None,
-) -> pd.DataFrame:
-    """
-    NOVA LÓGICA:
-    Cada lead cadastrado no período (leads_cadastrados_periodo) vira UMA linha.
-    A 'sdr_responsavel' vem da PRIMEIRA transferência feita por uma das SDRs foco
-    (em TODO o histórico, não só do período).
-
-    Isso garante que:
-    - Leads são contados pelo registerDate (período de cadastro)
-    - O dono é a SDR original que cadastrou e transferiu (mesmo que tenha sido
-      transferida fora do período)
-
-    Se `leads_cadastrados_periodo` for None, cai no modo antigo (transferências).
-    """
-    descartes_por_lead = descartes_por_lead or {}
-
-    # Mapa: leadId -> primeira transferência feita por SDR foco
-    transf_asc = sorted(transferencias, key=lambda t: t.get("createdAt") or "")
-    primeira_transf_sdr: dict[int, dict] = {}
-    for t in transf_asc:
-        lead_id = t.get("leadId")
-        if not lead_id:
-            continue
-        if t.get("originUserId") not in sdrs_foco:
-            continue
-        if lead_id in primeira_transf_sdr:
-            continue
-        primeira_transf_sdr[lead_id] = t
-
-    rows = []
-
-    if leads_cadastrados_periodo is not None:
-        # MODO NOVO: leads cadastrados no período como base
-        for lead in leads_cadastrados_periodo:
-            lead_id = lead.get("id")
-            t = primeira_transf_sdr.get(lead_id)
-            if not t:
-                # Lead cadastrado no período mas não foi transferido por nenhuma das 3 SDRs
-                continue
-            sdr_nome = sdrs_foco[t["originUserId"]]
-            # Sobrescreve com lead completo se tiver
-            lead_full = leads_completos.get(lead_id, lead)
-            sales = lead_full.get("salesRep") or {}
-            source = lead_full.get("source") or {}
-            descarte = descartes_por_lead.get(lead_id) or {}
-            rows.append({
-                "lead_id": lead_id,
-                "lead_nome": lead_full.get("lead"),
-                "stage_atual": lead_full.get("stage"),
-                "sdr_responsavel": sdr_nome,
-                "vendedor_atual": sales.get("name") if sales.get("id") else None,
-                "origem": source.get("value"),
-                "data_cadastro": lead_full.get("registerDate"),
-                "data_transferencia": t.get("createdAt"),
-                "data_atualizacao": lead_full.get("updateDate"),
-                "stage_descarte": descarte.get("stage"),
-                "motivo_descarte": descarte.get("reason"),
-            })
-    else:
-        # MODO ANTIGO: transferências como base (mantido por retrocompatibilidade)
-        for lead_id, t in primeira_transf_sdr.items():
-            sdr_nome = sdrs_foco[t["originUserId"]]
-            lead = leads_completos.get(lead_id)
-            if not lead:
-                continue
-            sales = lead.get("salesRep") or {}
-            source = lead.get("source") or {}
-            descarte = descartes_por_lead.get(lead_id) or {}
-            rows.append({
-                "lead_id": lead_id,
-                "lead_nome": lead.get("lead"),
-                "stage_atual": lead.get("stage"),
-                "sdr_responsavel": sdr_nome,
-                "vendedor_atual": sales.get("name") if sales.get("id") else None,
-                "origem": source.get("value"),
-                "data_cadastro": lead.get("registerDate"),
-                "data_transferencia": t.get("createdAt"),
-                "data_atualizacao": lead.get("updateDate"),
-                "stage_descarte": descarte.get("stage"),
-                "motivo_descarte": descarte.get("reason"),
-            })
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    for col in ["data_cadastro", "data_transferencia", "data_atualizacao"]:
-        df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
-    df["dias_no_funil"] = (df["data_atualizacao"] - df["data_transferencia"]).dt.days
-    return df
-
-
-def _calcular_metricas(
-    df_sdr: pd.DataFrame,
-    data_inicio: date,
-    data_fim: date,
-) -> dict[str, Any]:
-    """
-    Calcula métricas resumidas pra um SDR.
-
-    REGRAS:
-    - Leads (total) = todas as transferências da SDR no período
-    - Em andamento = leads ainda em status inicial AGORA (independente da data)
-    - Propostas/Ganhos/Descartes = só conta os que MUDARAM PARA esse status
-      dentro do período (usa updateDate como proxy de quando virou aquele status)
-    """
-    total = len(df_sdr)
-    if total == 0:
-        return {
-            "leads": 0,
-            "em_andamento": 0,
-            "propostas": 0,
-            "ganhos": 0,
-            "descartes": 0,
-            "conversao_pct": 0.0,
-            "dias_medio_ganho": None,
-        }
-
-    # Em andamento = status atual ainda inicial
-    em_andamento = df_sdr["stage_atual"].isin(STAGES_INICIAIS).sum()
-
-    # Pra propostas/ganhos/descartes: filtrar pela data em que mudou de status
-    # Usamos updateDate como proxy (última modificação do lead)
-    di = pd.Timestamp(data_inicio).tz_localize("UTC")
-    df_fim = pd.Timestamp(data_fim).tz_localize("UTC") + pd.Timedelta(days=1)
-
-    em_status_no_periodo = (
-        (df_sdr["data_atualizacao"] >= di) & (df_sdr["data_atualizacao"] < df_fim)
-    )
-
-    propostas = ((df_sdr["stage_atual"] == STAGE_PROPOSTA) & em_status_no_periodo).sum()
-    ganhos = ((df_sdr["stage_atual"] == STAGE_GANHO) & em_status_no_periodo).sum()
-    descartes = ((df_sdr["stage_atual"] == STAGE_DESCARTE) & em_status_no_periodo).sum()
-
-    # Tempo médio até ganho (entre transferência e fechamento)
-    df_ganhos = df_sdr[
-        (df_sdr["stage_atual"] == STAGE_GANHO) & em_status_no_periodo
-    ]
-    dias = df_ganhos["dias_no_funil"].mean() if not df_ganhos.empty else None
-
+def _montar_linha(
+    lead: dict,
+    sdr_nome: str,
+    descarte: dict | None = None,
+    categoria: str = "",
+) -> dict:
+    """Monta uma linha do DataFrame a partir de um lead."""
+    sales = lead.get("salesRep") or {}
+    source = lead.get("source") or {}
+    descarte = descarte or {}
     return {
-        "leads": int(total),
-        "em_andamento": int(em_andamento),
-        "propostas": int(propostas),
-        "ganhos": int(ganhos),
-        "descartes": int(descartes),
-        "conversao_pct": (ganhos / total * 100) if total else 0.0,
-        "dias_medio_ganho": float(dias) if dias is not None and not pd.isna(dias) else None,
+        "lead_id": lead.get("id"),
+        "lead_nome": lead.get("lead"),
+        "stage_atual": lead.get("stage"),
+        "sdr_responsavel": sdr_nome,
+        "vendedor_atual": sales.get("name") if sales.get("id") else None,
+        "origem": source.get("value"),
+        "data_cadastro": lead.get("registerDate"),
+        "data_atualizacao": lead.get("updateDate"),
+        "categoria": categoria,
+        "stage_descarte": descarte.get("stage"),
+        "motivo_descarte": descarte.get("reason"),
     }
 
 
@@ -349,14 +214,14 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     )
     with st.expander("ℹ️ Como o relatório conta os leads"):
         st.markdown(
-            "**Total de leads:** leads CADASTRADOS no Spotter dentro do período "
-            "(data de criação do lead). A SDR responsável é quem fez a primeira "
-            "transferência pro vendedor.\n\n"
-            "**Ganhos / Propostas / Descartes:** contados pelo mês em que o lead "
-            "MUDOU para esse status. Ex: lead cadastrado em abril e fechado em maio "
-            "aparece em **Total de leads de abril** e em **Ganhos de maio**.\n\n"
-            "**Em andamento:** leads ainda em status inicial agora "
-            "(BDR, Tentativa, Sem contato)."
+            "- **Total de leads:** cadastrados no Spotter dentro do período (`registerDate`)\n"
+            "- **Em andamento:** leads do total acima que NÃO são ganho nem descarte\n"
+            "- **Propostas:** leads que AGORA estão com status 'PROPOSTA ENVIADA' "
+            "(independente da data)\n"
+            "- **Ganhos:** leads que fecharam venda no período (`updateDate`), "
+            "**independente da data de cadastro** — pode ser lead de meses anteriores\n"
+            "- **Descartes:** leads descartados no período (`updateDate`), "
+            "**independente da data de cadastro**"
         )
 
     try:
@@ -365,69 +230,124 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v3:{data_inicio}:{data_fim}"
+    chave = f"sdr_v4:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
-        # NOVA LÓGICA:
-        # 1) Buscar leads CADASTRADOS no período (registerDate dentro do período)
-        # 2) Buscar transferências de todo histórico (sem filtro de data) pra
-        #    identificar a SDR que cadastrou cada lead
-        # 3) Cruzar tudo
-
+        # === 1) Leads cadastrados no período ===
         with st.spinner(f"Buscando leads cadastrados de {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}..."):
             try:
-                leads_periodo = _coletar_leads_cadastrados_periodo(
-                    cliente, data_inicio, data_fim
+                leads_cadastrados = _coletar_leads_filtrados(
+                    cliente, data_inicio, data_fim, campo_data="registerDate"
                 )
             except ExactError as e:
-                st.error(f"Erro ao buscar leads: {e}")
+                st.error(f"Erro ao buscar leads cadastrados: {e}")
                 return
 
-        if not leads_periodo:
-            st.info("Nenhum lead cadastrado no período.")
+        # === 2) Leads que viraram NEGOCIO FECHADO no período ===
+        with st.spinner("Buscando ganhos do período (independente da data de cadastro)..."):
+            try:
+                leads_ganhos = _coletar_leads_filtrados(
+                    cliente, data_inicio, data_fim,
+                    campo_data="updateDate",
+                    filtro_extra=f"stage eq '{STAGE_GANHO}'",
+                )
+            except ExactError as e:
+                st.error(f"Erro ao buscar ganhos: {e}")
+                return
+
+        # === 3) Leads descartados no período ===
+        with st.spinner("Buscando descartes do período..."):
+            try:
+                leads_descartados = _coletar_leads_filtrados(
+                    cliente, data_inicio, data_fim,
+                    campo_data="updateDate",
+                    filtro_extra=f"stage eq '{STAGE_DESCARTE}'",
+                )
+            except ExactError as e:
+                st.error(f"Erro ao buscar descartes: {e}")
+                return
+
+        # === 4) Leads ATUALMENTE em PROPOSTA ENVIADA ===
+        with st.spinner("Buscando leads em proposta..."):
+            try:
+                leads_propostas = _coletar_leads_atuais_propostas(cliente)
+            except ExactError as e:
+                st.error(f"Erro ao buscar propostas: {e}")
+                return
+
+        # === 5) Identificar SDR de cada lead via transferHistory ===
+        todos_ids = set()
+        todos_ids.update(l["id"] for l in leads_cadastrados)
+        todos_ids.update(l["id"] for l in leads_ganhos)
+        todos_ids.update(l["id"] for l in leads_descartados)
+        todos_ids.update(l["id"] for l in leads_propostas)
+
+        if not todos_ids:
+            st.info("Nenhum lead no período.")
             return
 
-        st.caption(f"Encontrados {len(leads_periodo)} leads cadastrados no período.")
-
-        # Buscar transferências (histórico amplo: 90 dias antes do início pra garantir)
-        from datetime import timedelta
-        di_busca = data_inicio - timedelta(days=90)
-
-        with st.spinner(f"Identificando SDR de cada lead (transferências desde {di_busca.strftime('%d/%m/%Y')})..."):
+        with st.spinner(f"Identificando SDR de {len(todos_ids)} leads..."):
             try:
-                transferencias = _coletar_transferencias(cliente, di_busca, data_fim)
+                primeira_sdr_por_lead = _coletar_transferencias_dos_leads(
+                    cliente, todos_ids
+                )
             except ExactError as e:
                 st.error(f"Erro ao buscar transferências: {e}")
                 return
 
-        # Lead completos: já temos os leads do período, mas precisamos garantir
-        # que temos o status atual atualizado (que já vem no /Leads, então OK)
-        leads_completos = {l["id"]: l for l in leads_periodo}
-        lead_ids_periodo = list(leads_completos.keys())
-
-        with st.spinner("Buscando descartes (etapa onde lead foi perdido)..."):
+        # === 6) Descartes (motivo + etapa) só pros descartados ===
+        ids_descartados = {l["id"] for l in leads_descartados}
+        with st.spinner("Buscando motivos de descarte..."):
             try:
-                descartes_por_lead = _coletar_descartes_por_lead(cliente, set(lead_ids_periodo))
+                descartes_info = _coletar_descartes_por_lead(cliente, ids_descartados)
             except ExactError as e:
-                st.warning(f"Não consegui buscar descartes: {e}")
-                descartes_por_lead = {}
+                st.warning(f"Não consegui buscar motivos: {e}")
+                descartes_info = {}
 
-        df = _construir_dataframe(
-            transferencias,
-            leads_completos,
-            SDRS_FOCO,
-            descartes_por_lead,
-            leads_cadastrados_periodo=leads_periodo,
-        )
+        # === 7) Montar DataFrame ===
+        rows = []
+        for lead in leads_cadastrados:
+            sdr_id = primeira_sdr_por_lead.get(lead["id"])
+            if sdr_id not in SDRS_FOCO:
+                continue
+            rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="cadastrado"))
+
+        for lead in leads_ganhos:
+            sdr_id = primeira_sdr_por_lead.get(lead["id"])
+            if sdr_id not in SDRS_FOCO:
+                continue
+            rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="ganho"))
+
+        for lead in leads_descartados:
+            sdr_id = primeira_sdr_por_lead.get(lead["id"])
+            if sdr_id not in SDRS_FOCO:
+                continue
+            rows.append(_montar_linha(
+                lead, SDRS_FOCO[sdr_id],
+                descarte=descartes_info.get(lead["id"]),
+                categoria="descartado",
+            ))
+
+        for lead in leads_propostas:
+            sdr_id = primeira_sdr_por_lead.get(lead["id"])
+            if sdr_id not in SDRS_FOCO:
+                continue
+            rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="proposta"))
+
+        df = pd.DataFrame(rows)
+        if df.empty:
+            st.info("Nenhum lead das 3 SDRs encontrado.")
+            return
+
+        for col in ["data_cadastro", "data_atualizacao"]:
+            df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
+
         cache.salvar_df(chave, df)
     else:
-        # reconverter datas após vir do cache
-        for col in ["data_cadastro", "data_transferencia", "data_atualizacao"]:
+        for col in ["data_cadastro", "data_atualizacao"]:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors="coerce", utc=True)
-        if "data_transferencia" in df.columns and "data_atualizacao" in df.columns:
-            df["dias_no_funil"] = (df["data_atualizacao"] - df["data_transferencia"]).dt.days
 
     if df is None or df.empty:
         st.info("Nenhum lead processado.")
@@ -439,22 +359,39 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     cols = st.columns(3)
     for i, (sdr_id, nome) in enumerate(SDRS_FOCO.items()):
         df_sdr = df[df["sdr_responsavel"] == nome]
-        m = _calcular_metricas(df_sdr, data_inicio, data_fim)
+
+        # Total de leads = só categoria 'cadastrado' (deduplica)
+        df_cadastrados = df_sdr[df_sdr["categoria"] == "cadastrado"].drop_duplicates("lead_id")
+        total_leads = len(df_cadastrados)
+
+        # Em andamento = cadastrados que NÃO são ganho nem descarte (status atual)
+        em_andamento = (~df_cadastrados["stage_atual"].isin(
+            [STAGE_GANHO, STAGE_DESCARTE]
+        )).sum()
+
+        # Propostas = leads ATUAIS em proposta (categoria 'proposta')
+        propostas = len(df_sdr[df_sdr["categoria"] == "proposta"].drop_duplicates("lead_id"))
+
+        # Ganhos = categoria 'ganho' (independente da data de cadastro)
+        ganhos = len(df_sdr[df_sdr["categoria"] == "ganho"].drop_duplicates("lead_id"))
+
+        # Descartes = categoria 'descartado' (independente da data de cadastro)
+        descartes = len(df_sdr[df_sdr["categoria"] == "descartado"].drop_duplicates("lead_id"))
+
+        # Conversão: ganhos / total cadastrados no período
+        conversao = (ganhos / total_leads * 100) if total_leads > 0 else 0.0
+
         with cols[i]:
             st.markdown(f"#### {nome}")
             c1, c2 = st.columns(2)
-            c1.metric("Total leads", m["leads"])
-            c2.metric("Em andamento", m["em_andamento"])
+            c1.metric("Total leads", total_leads)
+            c2.metric("Em andamento", int(em_andamento))
             c3, c4 = st.columns(2)
-            c3.metric("Propostas", m["propostas"])
-            c4.metric("Ganhos ✅", m["ganhos"])
+            c3.metric("Propostas", propostas)
+            c4.metric("Ganhos ✅", ganhos)
             c5, c6 = st.columns(2)
-            c5.metric("Descartes ❌", m["descartes"])
-            c6.metric("Conversão", f"{m['conversao_pct']:.1f}%")
-            if m["dias_medio_ganho"] is not None:
-                st.metric("Dias até ganho", f"{m['dias_medio_ganho']:.0f}d")
-            else:
-                st.metric("Dias até ganho", "—")
+            c5.metric("Descartes ❌", descartes)
+            c6.metric("Conversão", f"{conversao:.1f}%")
 
     st.divider()
 
@@ -464,21 +401,24 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     dados = []
     for sdr_id, nome in SDRS_FOCO.items():
         df_sdr = df[df["sdr_responsavel"] == nome]
-        m = _calcular_metricas(df_sdr, data_inicio, data_fim)
+        df_cadastrados = df_sdr[df_sdr["categoria"] == "cadastrado"].drop_duplicates("lead_id")
+        em_andamento = (~df_cadastrados["stage_atual"].isin(
+            [STAGE_GANHO, STAGE_DESCARTE]
+        )).sum()
+        propostas = len(df_sdr[df_sdr["categoria"] == "proposta"].drop_duplicates("lead_id"))
+        ganhos = len(df_sdr[df_sdr["categoria"] == "ganho"].drop_duplicates("lead_id"))
+        descartes = len(df_sdr[df_sdr["categoria"] == "descartado"].drop_duplicates("lead_id"))
+
         dados.extend([
-            {"SDR": nome, "Status": "Em andamento", "Quantidade": m["em_andamento"]},
-            {"SDR": nome, "Status": "Propostas", "Quantidade": m["propostas"]},
-            {"SDR": nome, "Status": "Ganhos", "Quantidade": m["ganhos"]},
-            {"SDR": nome, "Status": "Descartes", "Quantidade": m["descartes"]},
+            {"SDR": nome, "Status": "Em andamento", "Quantidade": int(em_andamento)},
+            {"SDR": nome, "Status": "Propostas", "Quantidade": propostas},
+            {"SDR": nome, "Status": "Ganhos", "Quantidade": ganhos},
+            {"SDR": nome, "Status": "Descartes", "Quantidade": descartes},
         ])
     df_g = pd.DataFrame(dados)
     fig = px.bar(
-        df_g,
-        x="SDR",
-        y="Quantidade",
-        color="Status",
-        barmode="group",
-        title="Comparativo de status entre SDRs",
+        df_g, x="SDR", y="Quantidade", color="Status", barmode="group",
+        title="Comparativo entre SDRs",
         color_discrete_map={
             "Em andamento": "#878787",
             "Propostas": "#378ADD",
@@ -491,129 +431,99 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.divider()
 
     # =========================================================
-    # GRÁFICO — etapa onde os leads foram descartados
+    # GRÁFICO — etapa de descarte
     # =========================================================
-    if "stage_descarte" in df.columns:
-        df_descartes = df[df["stage_descarte"].notna()].copy()
-        if not df_descartes.empty:
-            st.subheader("📉 Em qual etapa os leads foram descartados")
-            st.caption(
-                "Mostra em qual etapa do funil cada lead foi perdido. "
-                "Descartes em 'BDR' / 'TENTATIVA DE CONTATO' indicam leads pouco "
-                "qualificados. Descartes em 'PROPOSTA ENVIADA' indicam perdas "
-                "na negociação."
-            )
+    df_desc = df[(df["categoria"] == "descartado") & df["stage_descarte"].notna()].drop_duplicates("lead_id")
+    if not df_desc.empty:
+        st.subheader("📉 Em qual etapa os leads foram descartados")
+        st.caption(
+            "Descartes no período (independente da data de cadastro). "
+            "Descartes em 'BDR' / 'TENTATIVA' = lead pouco qualificado. "
+            "Descartes em 'PROPOSTA ENVIADA' = perda na negociação."
+        )
+        grouped = (
+            df_desc.groupby(["sdr_responsavel", "stage_descarte"]).size()
+            .reset_index(name="Quantidade")
+            .rename(columns={"sdr_responsavel": "SDR", "stage_descarte": "Etapa"})
+        )
+        fig_d = px.bar(
+            grouped, x="SDR", y="Quantidade", color="Etapa", barmode="group",
+            title="Descartes por etapa do funil",
+            category_orders={"Etapa": ["BDR", "SEM CONTATO", "TENTATIVA DE CONTATO", "PROPOSTA ENVIADA"]},
+            color_discrete_map={
+                "BDR": "#C8C8C8",
+                "SEM CONTATO": "#9F9F9F",
+                "TENTATIVA DE CONTATO": "#E5A663",
+                "PROPOSTA ENVIADA": "#D85A30",
+            },
+        )
+        st.plotly_chart(fig_d, use_container_width=True)
 
-            # Agrupar por SDR + etapa de descarte
-            grouped = (
-                df_descartes.groupby(["sdr_responsavel", "stage_descarte"])
-                .size()
-                .reset_index(name="Quantidade")
-                .rename(columns={
-                    "sdr_responsavel": "SDR",
-                    "stage_descarte": "Etapa do descarte",
-                })
-            )
-            fig_desc = px.bar(
-                grouped,
-                x="SDR",
-                y="Quantidade",
-                color="Etapa do descarte",
-                barmode="group",
-                title="Descartes por etapa do funil",
-                category_orders={
-                    "Etapa do descarte": [
-                        "BDR", "SEM CONTATO", "TENTATIVA DE CONTATO",
-                        "PROPOSTA ENVIADA", "NEGOCIO FECHADO",
-                    ],
-                },
-                color_discrete_map={
-                    "BDR": "#C8C8C8",
-                    "SEM CONTATO": "#9F9F9F",
-                    "TENTATIVA DE CONTATO": "#E5A663",
-                    "PROPOSTA ENVIADA": "#D85A30",
-                    "NEGOCIO FECHADO": "#7B3FB3",
-                },
-            )
-            st.plotly_chart(fig_desc, use_container_width=True)
+        st.markdown("**Top motivos de descarte**")
+        motivos = (
+            df_desc["motivo_descarte"].dropna().value_counts().head(10).reset_index()
+        )
+        motivos.columns = ["Motivo", "Quantidade"]
+        st.dataframe(motivos, use_container_width=True, hide_index=True)
 
-            # Top motivos de descarte
-            st.markdown("**Top motivos de descarte (todas as SDRs juntas)**")
-            motivos = (
-                df_descartes["motivo_descarte"]
-                .dropna()
-                .value_counts()
-                .head(10)
-                .reset_index()
-            )
-            motivos.columns = ["Motivo", "Quantidade"]
-            st.dataframe(motivos, use_container_width=True, hide_index=True)
-
-            st.divider()
+        st.divider()
 
     # =========================================================
     # TABELA DETALHADA
     # =========================================================
     st.subheader("Detalhamento dos leads")
 
+    cat_labels = {
+        "cadastrado": "Cadastrado no período",
+        "ganho": "Ganho no período",
+        "descartado": "Descartado no período",
+        "proposta": "Em proposta agora",
+    }
+    df_view = df.copy()
+    df_view["Categoria"] = df_view["categoria"].map(cat_labels)
+
     filtro_sdr = st.multiselect(
-        "Filtrar por SDR",
-        options=list(SDRS_FOCO.values()),
+        "Filtrar por SDR", options=list(SDRS_FOCO.values()),
         default=list(SDRS_FOCO.values()),
     )
-    filtro_stage = st.multiselect(
-        "Filtrar por status",
-        options=sorted(df["stage_atual"].dropna().unique()),
-        default=sorted(df["stage_atual"].dropna().unique()),
+    filtro_cat = st.multiselect(
+        "Filtrar por categoria",
+        options=list(cat_labels.values()),
+        default=list(cat_labels.values()),
     )
 
-    df_filtrado = df[
-        df["sdr_responsavel"].isin(filtro_sdr)
-        & df["stage_atual"].isin(filtro_stage)
+    df_filtrado = df_view[
+        df_view["sdr_responsavel"].isin(filtro_sdr)
+        & df_view["Categoria"].isin(filtro_cat)
     ].copy()
 
-    # Formatar pra exibição
-    df_view = df_filtrado.copy()
-    df_view["Transferência"] = df_view["data_transferencia"].dt.strftime("%d/%m/%Y")
+    df_filtrado["Cadastro"] = df_filtrado["data_cadastro"].dt.strftime("%d/%m/%Y")
+    df_filtrado["Atualização"] = df_filtrado["data_atualizacao"].dt.strftime("%d/%m/%Y")
 
-    # Data ganho/perda = data de atualização do lead (quando virou ganho/descarte)
-    # Só mostra se o status atual é Ganho ou Descartado
-    df_view["Data ganho/perda"] = df_view.apply(
-        lambda row: row["data_atualizacao"].strftime("%d/%m/%Y")
-        if pd.notna(row["data_atualizacao"]) and row["stage_atual"] in [STAGE_GANHO, STAGE_DESCARTE]
-        else "",
-        axis=1,
-    )
-
-    colunas_view = [
-        "Transferência", "lead_nome", "stage_atual", "Data ganho/perda",
-        "sdr_responsavel", "vendedor_atual", "origem", "dias_no_funil",
+    colunas = [
+        "Categoria", "Cadastro", "Atualização", "lead_nome", "stage_atual",
+        "sdr_responsavel", "vendedor_atual", "origem",
     ]
-    rename_map = {
+    if "stage_descarte" in df_filtrado.columns:
+        colunas.extend(["stage_descarte", "motivo_descarte"])
+
+    rename = {
         "lead_nome": "Lead",
         "stage_atual": "Status atual",
-        "sdr_responsavel": "SDR (cadastrou)",
-        "vendedor_atual": "Vendedor atual",
+        "sdr_responsavel": "SDR",
+        "vendedor_atual": "Vendedor",
         "origem": "Origem",
-        "dias_no_funil": "Dias",
+        "stage_descarte": "Etapa descarte",
+        "motivo_descarte": "Motivo descarte",
     }
-    # Adicionar colunas de descarte se existirem
-    if "stage_descarte" in df_view.columns:
-        colunas_view.extend(["stage_descarte", "motivo_descarte"])
-        rename_map["stage_descarte"] = "Etapa do descarte"
-        rename_map["motivo_descarte"] = "Motivo descarte"
+    df_tabela = df_filtrado[colunas].rename(columns=rename).sort_values("Atualização", ascending=False)
 
-    df_view = df_view[colunas_view].rename(columns=rename_map).sort_values(
-        "Transferência", ascending=False
-    )
+    st.caption(f"{len(df_tabela)} leads")
+    st.dataframe(df_tabela, use_container_width=True, hide_index=True)
 
-    st.caption(f"{len(df_view)} leads filtrados")
-    st.dataframe(df_view, use_container_width=True, hide_index=True)
-
-    csv = df_view.to_csv(index=False).encode("utf-8-sig")
+    csv = df_tabela.to_csv(index=False).encode("utf-8-sig")
     st.download_button(
-        "📥 Baixar CSV",
-        csv,
+        "📥 Baixar CSV", csv,
         file_name=f"sdr_performance_{data_inicio}_{data_fim}.csv",
         mime="text/csv",
     )

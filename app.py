@@ -105,40 +105,13 @@ with tab_sdrs:
 # 3C PLUS
 # -------------------------------------------------------------
 with tab_3c:
-    st.subheader("3C Plus — Chamadas")
-    chave_3c = f"3cplus:calls:{data_inicio}:{data_fim}"
-    try:
-        cliente_3c = TresCPlusClient()
-
-        def fetch_3c():
-            resp = cliente_3c.listar_chamadas(data_inicio, data_fim)
-            # APIs costumam envelopar em {"data": [...]} ou {"calls": [...]}
-            if isinstance(resp, dict):
-                for k in ("data", "calls", "items", "results"):
-                    if k in resp and isinstance(resp[k], list):
-                        return resp[k]
-                return [resp]
-            return resp
-
-        df_3c = carregar_com_cache(chave_3c, fetch_3c, ttl)
-        if df_3c.empty:
-            st.info("Nenhuma chamada no período.")
-        else:
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total de chamadas", len(df_3c))
-            if "duration" in df_3c.columns:
-                col2.metric("Duração média (s)", f"{df_3c['duration'].mean():.0f}")
-            if "status" in df_3c.columns:
-                atendidas = (df_3c["status"] == "answered").sum()
-                col3.metric("Atendidas", atendidas)
-
-            st.dataframe(df_3c, use_container_width=True)
-
-            if "status" in df_3c.columns:
-                fig = px.histogram(df_3c, x="status", title="Chamadas por status")
-                st.plotly_chart(fig, use_container_width=True)
-    except TresCPlusError as e:
-        mostrar_erro_amigavel("Falha ao consultar 3C Plus", e)
+    from relatorios import tres_c_plus_performance
+    tres_c_plus_performance.renderizar(
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+        ttl_minutos=ttl,
+        usar_cache=usar_cache,
+    )
 
 # -------------------------------------------------------------
 # EXACT

@@ -1,104 +1,179 @@
 """
-Conector do SGCor via automação de navegador (Playwright).
+Conector SGCor — API REST oficial.
 
-Como SGCor não oferece API pública, fazemos login web e baixamos relatórios.
-Para usar, instale o Playwright e os navegadores:
+Endpoints usados (todos read-only via API oficial):
+- POST /login → token JWT
+- POST /producao/pesquisar → lista propostas/apólices
+- POST /parcelas/nao_recebidas/pesquisar → inadimplência
+- POST /parcelas/repasses/pesquisar → comissões a receber
+- POST /sinistros/pesquisar → sinistros
 
-    pip install playwright
-    playwright install chromium
-
-Os seletores CSS abaixo são genéricos — você vai precisar abrir o SGCor,
-inspecionar (F12) os campos de login e o menu de relatórios, e ajustar
-as strings marcadas com TODO.
-
-Quando o SGCor oferecer API REST, substitua esta classe por um cliente
-HTTP no mesmo formato (mesma assinatura de métodos) e o app não precisa
-ser alterado.
+Base URL: https://apirest.gruposgcor.com.br/api
+Autenticação: email + senha (formdata) → devolve token JWT
 """
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Any
 
-import pandas as pd
+import requests
 
 
 class SGCorError(Exception):
-    pass
+    """Erro nas chamadas à API do SGCor."""
 
 
 class SGCorClient:
-    def __init__(
+    """
+    Cliente READ-ONLY pra API do SGCor.
+
+    SEGURANÇA: este conector NUNCA faz POST/PUT/DELETE de dados modificáveis.
+    Os endpoints de "pesquisar" usam POST por convenção HTTP mas são consultas.
+    """
+    BASE_URL = "https://apirest.gruposgcor.com.br/api"
+
+    def __init__(self, email: str | None = None, senha: str | None = None):
+        self.email = email or os.getenv("SGCOR_EMAIL", "")
+        self.senha = senha or os.getenv("SGCOR_SENHA", "")
+        if not self.email or not self.senha:
+            raise SGCorError("Credenciais SGCor não configuradas (SGCOR_EMAIL, SGCOR_SENHA)")
+        self._token: str | None = None
+
+    def _login(self) -> str:
+        """Faz login e retorna o token JWT."""
+        try:
+            r = requests.post(
+                f"{self.BASE_URL}/login",
+                data={"email": self.email, "senha": self.senha},
+                headers={"Accept": "application/json"},
+                timeout=30,
+            )
+            r.raise_for_status()
+            payload = r.json()
+            token = payload.get("data", {}).get("token") or payload.get("token")
+            if not token:
+                raise SGCorError(f"Login OK mas sem token: {payload}")
+            return token
+        except requests.RequestException as e:
+            raise SGCorError(f"Falha no login: {e}") from e
+
+    def _headers(self) -> dict[str, str]:
+        if not self._token:
+            self._token = self._login()
+        return {
+            "Authorization": f"Bearer {self._token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    def _post_pesquisar(
         self,
-        url: str | None = None,
-        usuario: str | None = None,
-        senha: str | None = None,
-        headless: bool = True,
-    ):
-        self.url = url or os.getenv("SGCOR_URL")
-        self.usuario = usuario or os.getenv("SGCOR_USER")
-        self.senha = senha or os.getenv("SGCOR_PASSWORD")
-        self.headless = headless
-        if not all([self.url, self.usuario, self.senha]):
-            raise SGCorError("Credenciais do SGCor não configuradas. Edite o .env.")
+        path: str,
+        body: dict[str, Any],
+        max_paginas: int = 50,
+    ) -> list[dict]:
+        """
+        Pagina automaticamente um endpoint de pesquisar.
+        Retorna todos os itens encontrados.
+        Limite: 50 páginas (10.000 itens com per_page=200).
+        """
+        todos: list[dict] = []
+        url = f"{self.BASE_URL}{path}"
 
-    def _baixar_relatorio(self, nome_relatorio: str, download_dir: Path) -> Path:
-        """Login no SGCor e download de um relatório. Retorna o caminho do CSV/XLSX."""
-        from playwright.sync_api import sync_playwright
+        for page in range(1, max_paginas + 1):
+            try:
+                r = requests.post(
+                    f"{url}?page={page}",
+                    json=body,
+                    headers=self._headers(),
+                    timeout=90,
+                )
+                if r.status_code == 401:
+                    # Token expirou — reautentica e tenta de novo
+                    self._token = None
+                    r = requests.post(
+                        f"{url}?page={page}",
+                        json=body,
+                        headers=self._headers(),
+                        timeout=90,
+                    )
+                r.raise_for_status()
+                payload = r.json()
+            except requests.RequestException as e:
+                raise SGCorError(f"Erro em {path}: {e}") from e
 
-        download_dir.mkdir(parents=True, exist_ok=True)
+            itens = payload.get("data", [])
+            if not itens:
+                break
+            todos.extend(itens)
 
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
-            context = browser.new_context(accept_downloads=True)
-            page = context.new_page()
+            meta = payload.get("meta", {})
+            links = payload.get("links", {})
+            if not links.get("next"):
+                break
+        return todos
 
-            # 1) login
-            page.goto(self.url)
-            # TODO: ajustar seletores conforme HTML real do SGCor
-            page.fill('input[name="usuario"]', self.usuario)
-            page.fill('input[name="senha"]', self.senha)
-            page.click('button[type="submit"]')
-            page.wait_for_load_state("networkidle")
+    # =========================================================
+    # Produção (apólices/propostas)
+    # =========================================================
+    def producao_pesquisar(
+        self,
+        tipo_data: str,
+        data_inicial: str,
+        data_final: str,
+    ) -> list[dict]:
+        """
+        Lista apólices/propostas.
+        tipo_data: 'dataEmitida', 'dataVigenciaInicial', 'dataVigenciaFinal', 'dataCancelada'
+        Datas no formato 'YYYY-MM-DD'.
+        """
+        return self._post_pesquisar(
+            "/producao/pesquisar",
+            {
+                "tipoData": tipo_data,
+                "dataInicial": data_inicial,
+                "dataFinal": data_final,
+            },
+        )
 
-            # 2) navegar até o relatório desejado
-            # TODO: substituir pelos cliques reais até a tela do relatório
-            page.click(f'text={nome_relatorio}')
-            page.wait_for_load_state("networkidle")
+    # =========================================================
+    # Parcelas não recebidas (inadimplência)
+    # =========================================================
+    def parcelas_nao_recebidas(
+        self,
+        tipo_data: str,
+        data_inicial: str,
+        data_final: str,
+    ) -> list[dict]:
+        """
+        tipo_data: 'dataVencimento', 'dataVigenciaInicial', 'dataVigenciaFinal'
+        """
+        return self._post_pesquisar(
+            "/parcelas/nao_recebidas/pesquisar",
+            {
+                "tipoData": tipo_data,
+                "dataInicial": data_inicial,
+                "dataFinal": data_final,
+            },
+        )
 
-            # 3) clicar em exportar e capturar o download
-            # TODO: ajustar o seletor do botão de exportar
-            with page.expect_download() as download_info:
-                page.click('text=Exportar')
-            download = download_info.value
-            destino = download_dir / download.suggested_filename
-            download.save_as(destino)
-
-            browser.close()
-            return destino
-
-    # ---------- métodos de negócio ----------
-    def listar_apolices(self, download_dir: Path | str = "./downloads") -> pd.DataFrame:
-        """Baixa o relatório de apólices e retorna como DataFrame."""
-        download_dir = Path(download_dir)
-        arquivo = self._baixar_relatorio("Apólices", download_dir)
-        if arquivo.suffix.lower() in {".xlsx", ".xls"}:
-            return pd.read_excel(arquivo)
-        return pd.read_csv(arquivo, sep=None, engine="python", encoding="utf-8-sig")
-
-    def listar_sinistros(self, download_dir: Path | str = "./downloads") -> pd.DataFrame:
-        download_dir = Path(download_dir)
-        arquivo = self._baixar_relatorio("Sinistros", download_dir)
-        if arquivo.suffix.lower() in {".xlsx", ".xls"}:
-            return pd.read_excel(arquivo)
-        return pd.read_csv(arquivo, sep=None, engine="python", encoding="utf-8-sig")
-
-    # Modo manual: se o Playwright der trabalho no começo, você pode
-    # exportar do SGCor manualmente e usar este método para carregar:
-    @staticmethod
-    def carregar_arquivo(caminho: str | Path) -> pd.DataFrame:
-        caminho = Path(caminho)
-        if caminho.suffix.lower() in {".xlsx", ".xls"}:
-            return pd.read_excel(caminho)
-        return pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8-sig")
+    # =========================================================
+    # Repasses ao produtor (comissões)
+    # =========================================================
+    def parcelas_repasses(
+        self,
+        tipo_data: str,
+        data_inicial: str,
+        data_final: str,
+    ) -> list[dict]:
+        """
+        tipo_data: 'dataVencimento', 'dataVigenciaInicial', 'dataVigenciaFinal'
+        """
+        return self._post_pesquisar(
+            "/parcelas/repasses/pesquisar",
+            {
+                "tipoData": tipo_data,
+                "dataInicial": data_inicial,
+                "dataFinal": data_final,
+            },
+        )

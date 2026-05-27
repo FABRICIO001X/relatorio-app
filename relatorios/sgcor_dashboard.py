@@ -53,9 +53,22 @@ def _flatten_proposta(p: dict) -> dict:
 
 
 def _flatten_parcela(p: dict) -> dict:
-    """Achata uma parcela não recebida ou repasse."""
-    parcelas = p.get("parcelas") or []
-    primeira = parcelas[0] if parcelas else {}
+    """Achata uma parcela não recebida ou repasse.
+
+    O campo `parcelas` pode vir como lista [...] ou dict {0: {...}, 1: {...}}
+    ou ainda como um único dict {...}. Tratamos todos os casos.
+    """
+    parcelas_raw = p.get("parcelas")
+    primeira = {}
+    if isinstance(parcelas_raw, list) and parcelas_raw:
+        primeira = parcelas_raw[0] if isinstance(parcelas_raw[0], dict) else {}
+    elif isinstance(parcelas_raw, dict):
+        # pode ser {0: {...}, 1: {...}} ou um único {...}
+        valores = list(parcelas_raw.values()) if parcelas_raw else []
+        if valores and isinstance(valores[0], dict):
+            primeira = valores[0]
+        elif "dataVencimento" in parcelas_raw or "valor" in parcelas_raw:
+            primeira = parcelas_raw
     return {
         "propostaId": p.get("propostaId"),
         "proposta": p.get("proposta"),

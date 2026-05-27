@@ -369,52 +369,79 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             )
 
     with aba_prop:
-        st.markdown(f"**{len(df_prop)} propostas enviadas no período**")
         if df_prop.empty:
             st.info("Nenhuma proposta no período.")
         else:
-            df_v = df_prop.copy()
-            df_v["Data entrou em proposta"] = pd.to_datetime(df_v["data_entrou"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
-            df_v = df_v[["Data entrou em proposta", "consultora", "lead_nome", "origem", "status_atual"]].rename(columns={
-                "consultora": "Consultora",
-                "lead_nome": "Lead",
-                "origem": "Origem (etapa anterior)",
-                "status_atual": "Status atual",
-            }).sort_values("Data entrou em proposta", ascending=False)
-            st.dataframe(df_v, use_container_width=True, hide_index=True)
-            baixar_csv(df_prop, "propostas")
+            filtro_p = st.multiselect(
+                "Filtrar consultora",
+                options=NOMES_CONSULTORAS,
+                default=NOMES_CONSULTORAS,
+                key="filtro_prop",
+            )
+            df_v = df_prop[df_prop["consultora"].isin(filtro_p)].copy()
+            st.markdown(f"**{len(df_v)} propostas enviadas no período**")
+            if df_v.empty:
+                st.info("Nenhuma proposta da(s) consultora(s) selecionada(s).")
+            else:
+                df_v["Data entrou em proposta"] = pd.to_datetime(df_v["data_entrou"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
+                df_v = df_v[["Data entrou em proposta", "consultora", "lead_nome", "origem", "status_atual"]].rename(columns={
+                    "consultora": "Consultora",
+                    "lead_nome": "Lead",
+                    "origem": "Origem (etapa anterior)",
+                    "status_atual": "Status atual",
+                }).sort_values("Data entrou em proposta", ascending=False)
+                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                baixar_csv(df_prop[df_prop["consultora"].isin(filtro_p)], "propostas")
 
     with aba_ganho:
-        st.markdown(f"**{len(df_ganhos)} negócios fechados no período**")
         if df_ganhos.empty:
             st.info("Nenhum ganho no período.")
         else:
-            df_v = df_ganhos.copy()
-            df_v["Data ganho"] = pd.to_datetime(df_v["data_ganho"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
-            df_v["Cadastrado"] = pd.to_datetime(df_v["data_cadastro"], errors="coerce").dt.strftime("%d/%m/%Y")
-            df_v = df_v[["Data ganho", "consultora", "lead_nome", "Cadastrado", "dias_ate_fechar"]].rename(columns={
-                "consultora": "Consultora",
-                "lead_nome": "Lead",
-                "dias_ate_fechar": "Dias até fechar",
-            }).sort_values("Data ganho", ascending=False)
-            st.dataframe(df_v, use_container_width=True, hide_index=True)
-            baixar_csv(df_ganhos, "ganhos")
+            filtro_g = st.multiselect(
+                "Filtrar consultora",
+                options=NOMES_CONSULTORAS,
+                default=NOMES_CONSULTORAS,
+                key="filtro_ganho",
+            )
+            df_v = df_ganhos[df_ganhos["consultora"].isin(filtro_g)].copy()
+            st.markdown(f"**{len(df_v)} negócios fechados no período**")
+            if df_v.empty:
+                st.info("Nenhum ganho da(s) consultora(s) selecionada(s).")
+            else:
+                df_v["Data ganho"] = pd.to_datetime(df_v["data_ganho"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
+                df_v["Cadastrado"] = pd.to_datetime(df_v["data_cadastro"], errors="coerce").dt.strftime("%d/%m/%Y")
+                df_v = df_v[["Data ganho", "consultora", "lead_nome", "Cadastrado", "dias_ate_fechar"]].rename(columns={
+                    "consultora": "Consultora",
+                    "lead_nome": "Lead",
+                    "dias_ate_fechar": "Dias até fechar",
+                }).sort_values("Data ganho", ascending=False)
+                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                baixar_csv(df_ganhos[df_ganhos["consultora"].isin(filtro_g)], "ganhos")
 
     with aba_bdr:
-        st.markdown(f"**{len(df_bdr)} leads em BDR parados há mais de 1 dia**")
         if df_bdr.empty:
             st.info("Nenhum lead em atraso no BDR.")
         else:
-            df_v = df_bdr.copy()
-            df_v["Cadastrado"] = pd.to_datetime(df_v["data_cadastro"], errors="coerce").dt.strftime("%d/%m/%Y")
-            df_v["Última atualização"] = pd.to_datetime(df_v["data_update"], errors="coerce").dt.strftime("%d/%m/%Y")
-            df_v = df_v[["consultora", "lead_nome", "Cadastrado", "Última atualização", "dias_parado"]].rename(columns={
-                "consultora": "Consultora",
-                "lead_nome": "Lead",
-                "dias_parado": "Dias parado",
-            }).sort_values("Dias parado", ascending=False)
-            st.dataframe(df_v, use_container_width=True, hide_index=True)
-            baixar_csv(df_bdr, "bdr_atraso")
+            filtro_b = st.multiselect(
+                "Filtrar consultora",
+                options=NOMES_CONSULTORAS,
+                default=NOMES_CONSULTORAS,
+                key="filtro_bdr",
+            )
+            df_v = df_bdr[df_bdr["consultora"].isin(filtro_b)].copy()
+            st.markdown(f"**{len(df_v)} leads em BDR parados há mais de 1 dia**")
+            if df_v.empty:
+                st.info("Nenhum lead da(s) consultora(s) selecionada(s).")
+            else:
+                df_v["Cadastrado"] = pd.to_datetime(df_v["data_cadastro"], errors="coerce").dt.strftime("%d/%m/%Y")
+                df_v["Última atualização"] = pd.to_datetime(df_v["data_update"], errors="coerce").dt.strftime("%d/%m/%Y")
+                df_v = df_v[["consultora", "lead_nome", "Cadastrado", "Última atualização", "dias_parado"]].rename(columns={
+                    "consultora": "Consultora",
+                    "lead_nome": "Lead",
+                    "dias_parado": "Dias parado",
+                }).sort_values("Dias parado", ascending=False)
+                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                baixar_csv(df_bdr[df_bdr["consultora"].isin(filtro_b)], "bdr_atraso")
 
     with aba_tempo:
         st.markdown("**Tempo médio entre cadastro e fechamento por consultora**")

@@ -1,167 +1,143 @@
 """
-Cliente da API REST do 3C Plus.
+Conector 3C Plus (Fluxoti) — API REST oficial v1.
 
-Endpoints validados contra o SDK oficial em:
-    https://github.com/fluxoti/3cplusv2-sdk-js  (fork público)
-    https://github.com/3C-Plus/3cplusv2-sdk     (org oficial)
+Descobertas validadas em produção:
+- Base URL: https://app.3c.plus/api/v1
+- Auth: query string ?api_token=TOKEN (NÃO header Bearer)
+- Datas: formato 'Y-m-d H:i:s' (com horário, NÃO só YYYY-MM-DD)
 
-Autenticação: header `Authorization: Bearer <token>`
-Base URL real: https://app.3c.fluxoti.com
-Prefixo de versão: /v1
+Endpoints usados (TODOS read-only via GET):
+- /agents → lista de operadores
+- /calls → histórico de chamadas
+- /qualification/statistics → resultados das ligações (atendida, ocupado, etc.)
+- /agents/statistics/by_agent → produtividade por operador
 
-ENDPOINTS DE CHAMADAS (src/v1/call.js):
-    GET  /v1/calls                                  -> histórico de chamadas
-    GET  /v1/calls/{id}                             -> chamada específica
-    GET  /v1/records/{year}/{month}/{day}/{file}    -> baixar gravação
-
-ENDPOINTS DE AGENTE (src/v1/agent.js):
-    GET  /v1/agent/calls           -> histórico de chamadas do agente
-    POST /v1/agent/login           -> login do agente
-    POST /v1/agent/webphone/login  -> login no webphone
-    GET  /v1/agent/logout          -> logout
-    GET  /v1/agent/connect
-    GET  /v1/agent/campaigns       -> campanhas do agente
-    POST /v1/qualify               -> qualificar chamada
-    POST /v1/hangup                -> desligar
-    POST /v1/agent/manual_call/dial
-    POST /v1/agent/manual_call/enter
-    POST /v1/agent/manual_call/exit
-
-NÃO confundir com endpoints do site institucional 3c.fluxoti.com/api/v1/click2call
-(esses são da API de Click2Call e Omnichannel WhatsApp, base diferente).
+⚠️ SEGURANÇA: este conector NUNCA faz POST/PUT/DELETE.
 """
 from __future__ import annotations
 
 import os
-from datetime import date
 from typing import Any
 
 import requests
 
 
 class TresCPlusError(Exception):
-    pass
+    """Erro nas chamadas à API do 3C Plus."""
 
 
 class TresCPlusClient:
-    def __init__(self, token: str | None = None, base_url: str | None = None):
-        self.token = token or os.getenv("TRES_C_PLUS_TOKEN")
-        self.base_url = (
-            base_url
-            or os.getenv("TRES_C_PLUS_BASE_URL", "https://app.3c.fluxoti.com")
-        ).rstrip("/")
-        if not self.token or self.token.startswith("cole_"):
-            raise TresCPlusError(
-                "Token do 3C Plus não configurado. Edite o arquivo .env."
-            )
+    """Cliente READ-ONLY pra API do 3C Plus."""
+    BASE_URL = "https://app.3c.plus/api/v1"
 
-    # ---------- baixo nível ----------
-    def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.token}",
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
+    def __init__(self, api_token: str | None = None):
+        self.api_token = api_token or os.getenv("TRES_C_PLUS_TOKEN", "")
+        if not self.api_token:
+            raise TresCPlusError("Token 3C Plus não configurado (TRES_C_PLUS_TOKEN)")
 
-    def _request(
+    def _get(
         self,
-        method: str,
         path: str,
         params: dict[str, Any] | None = None,
-        json: dict[str, Any] | None = None,
-    ) -> Any:
-        # TRAVA DE SEGURANÇA: este conector é READ-ONLY.
-        # Bloqueia explicitamente qualquer método que modifique dados.
-        if method.upper() != "GET":
-            raise TresCPlusError(
-                f"Operação {method} bloqueada. Conector é read-only por design."
-            )
-        url = f"{self.base_url}/v1{path}"
-        try:
-            r = requests.request(
-                method,
-                url,
-                headers=self._headers(),
-                params=params or {},
-                json=json,
-                timeout=30,
-            )
-            r.raise_for_status()
-            return r.json() if r.content else None
-        except requests.HTTPError as e:
-            raise TresCPlusError(
-                f"HTTP {r.status_code} em {method} {path}: {r.text[:200]}"
-            ) from e
-        except requests.RequestException as e:
-            raise TresCPlusError(f"Falha de rede em {path}: {e}") from e
+    ) -> dict:
+        """Faz GET autenticado. Retorna o JSON.
 
-    def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
-        return self._request("GET", path, params=params)
+        TRAVA DE SEGURANÇA: este método só aceita GET.
+        """
+        # api_token sempre vai como query string
+        all_params = {"api_token": self.api_token, **(params or {})}
+        url = f"{self.BASE_URL}{path}"
 
-    # Por segurança, este conector é READ-ONLY.
-    # Métodos POST/PUT/DELETE foram REMOVIDOS intencionalmente.
-    # NUNCA adicione _post/_put/_delete aqui sem revisão do usuário.
+        # Tenta até 2 vezes em caso de timeout
+        ultimo_erro = None
+        for tentativa in range(2):
+            try:
+                r = requests.get(url, params=all_params, timeout=90)
+                if r.status_code >= 500:
+                    # Servidor com problema, tenta de novo
+                    ultimo_erro = r.text[:200]
+                    continue
+                if r.status_code >= 400:
+                    raise TresCPlusError(
+                        f"HTTP {r.status_code} em {path}: {r.text[:300]}"
+                    )
+                return r.json() if r.content else {}
+            except requests.exceptions.Timeout as e:
+                ultimo_erro = str(e)
+                continue
+            except requests.RequestException as e:
+                raise TresCPlusError(f"Falha de rede em {path}: {e}") from e
+        raise TresCPlusError(f"Timeout em {path} após 2 tentativas: {ultimo_erro}")
 
-    # =============================================================
-    # CHAMADAS  (src/v1/call.js)
-    # =============================================================
+    def _get_paginado(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        max_paginas: int = 50,
+        per_page: int = 200,
+    ) -> list[dict]:
+        """Pagina automaticamente endpoints que devolvem meta.pagination."""
+        todos: list[dict] = []
+        params = dict(params or {})
+        params["per_page"] = per_page
+        for page in range(1, max_paginas + 1):
+            params["page"] = page
+            payload = self._get(path, params=params)
+            itens = payload.get("data", [])
+            if not itens:
+                break
+            todos.extend(itens)
+            # Olhar paginação
+            pag = (payload.get("meta") or {}).get("pagination") or {}
+            total_pages = pag.get("total_pages")
+            if total_pages and page >= total_pages:
+                break
+            if len(itens) < per_page:
+                break
+        return todos
+
+    # =========================================================
+    # Agentes
+    # =========================================================
+    def listar_agentes(self) -> list[dict]:
+        """Lista todos os agentes do 3C Plus."""
+        payload = self._get("/agents")
+        return payload.get("data") or payload or []
+
+    # =========================================================
+    # Chamadas
+    # =========================================================
     def listar_chamadas(
         self,
-        data_inicio: date | None = None,
-        data_fim: date | None = None,
-        campanha_id: int | None = None,
-        page: int = 1,
-        per_page: int = 100,
-        **filtros_extras: Any,
-    ) -> Any:
+        start_date: str,
+        end_date: str,
+        max_paginas: int = 30,
+    ) -> list[dict]:
         """
-        Histórico de chamadas da empresa. GET /v1/calls
-
-        Os filtros aceitos não estão documentados no SDK (que repassa qualquer
-        dict). Os nomes abaixo seguem a convenção REST mais comum. Se a sua API
-        usar nomes diferentes (ex: 'from'/'to', 'date_start'/'date_end'), passe
-        via **filtros_extras.
+        Lista chamadas entre start_date e end_date.
+        Formato esperado: 'Y-m-d H:i:s' (ex: '2026-05-01 00:00:00').
         """
-        params: dict[str, Any] = {"page": page, "per_page": per_page}
-        if data_inicio:
-            params["start_date"] = data_inicio.isoformat()
-        if data_fim:
-            params["end_date"] = data_fim.isoformat()
-        if campanha_id is not None:
-            params["campaign_id"] = campanha_id
-        params.update(filtros_extras)
-        return self._get("/calls", params=params)
+        return self._get_paginado(
+            "/calls",
+            params={"start_date": start_date, "end_date": end_date},
+            max_paginas=max_paginas,
+        )
 
-    def chamada(self, call_id: str | int) -> Any:
-        """Chamada específica pelo ID. GET /v1/calls/{id}"""
-        return self._get(f"/calls/{call_id}")
-
-    def url_gravacao(self, ano: int, mes: int, dia: int, arquivo: str) -> str:
-        """Monta a URL pra baixar uma gravação. Você usa o token no header pra acessar."""
-        return f"{self.base_url}/v1/records/{ano}/{mes}/{dia}/{arquivo}"
-
-    def baixar_gravacao(
-        self, ano: int, mes: int, dia: int, arquivo: str, destino: str
-    ) -> str:
-        """Baixa a gravação e salva no caminho 'destino'. Retorna o caminho."""
-        url = self.url_gravacao(ano, mes, dia, arquivo)
-        try:
-            r = requests.get(url, headers=self._headers(), timeout=60, stream=True)
-            r.raise_for_status()
-            with open(destino, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            return destino
-        except requests.RequestException as e:
-            raise TresCPlusError(f"Falha ao baixar gravação: {e}") from e
-
-    # =============================================================
-    # AGENTE  (src/v1/agent.js)
-    # =============================================================
-    def chamadas_do_agente(self, **filtros: Any) -> Any:
-        """Histórico de chamadas do agente autenticado. GET /v1/agent/calls"""
-        return self._get("/agent/calls", params=filtros)
-
-    def campanhas_do_agente(self) -> Any:
-        """Campanhas do agente. GET /v1/agent/campaigns"""
-        return self._get("/agent/campaigns")
+    # =========================================================
+    # Qualificações (resultados das ligações)
+    # =========================================================
+    def qualification_statistics(
+        self,
+        start_date: str,
+        end_date: str,
+        agent_id: int | None = None,
+    ) -> list[dict]:
+        """
+        Estatísticas de qualificação (resultado das ligações) por dia.
+        Retorna lista de {date, qualifications: {...}}.
+        """
+        params = {"start_date": start_date, "end_date": end_date}
+        if agent_id:
+            params["agent_id"] = agent_id
+        payload = self._get("/qualification/statistics", params=params)
+        return payload.get("data") or []

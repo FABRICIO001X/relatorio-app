@@ -203,57 +203,13 @@ with tab_exact:
 # SGCOR
 # -------------------------------------------------------------
 with tab_sgcor:
-    st.subheader("SGCor")
-    st.info(
-        "🚧 **Modo upload manual** — a API oficial do SGCor está sendo solicitada. "
-        "Por enquanto, exporte o relatório que quiser no SGCor (CSV ou XLSX) e suba aqui. "
-        "Quando a API chegar, é só trocar o conector — o resto do app não muda."
+    from relatorios import sgcor_dashboard
+    sgcor_dashboard.renderizar(
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+        ttl_minutos=ttl,
+        usar_cache=usar_cache,
     )
-
-    tipo_relatorio = st.selectbox(
-        "Tipo de relatório",
-        [
-            "Propostas / Apólices",
-            "Sinistros",
-            "Comissões / Repasses",
-            "Pagamentos",
-            "Clientes inadimplentes",
-            "Produção",
-            "Renovações",
-            "Outro",
-        ],
-    )
-
-    arquivo = st.file_uploader(
-        f"Suba o arquivo de {tipo_relatorio.lower()} (CSV ou XLSX)",
-        type=["csv", "xlsx", "xls"],
-        key=f"sgcor_upload_{tipo_relatorio}",
-    )
-
-    df_sgcor: pd.DataFrame | None = None
-
-    if arquivo is not None:
-        try:
-            if arquivo.name.lower().endswith((".xlsx", ".xls")):
-                df_sgcor = pd.read_excel(arquivo)
-            else:
-                df_sgcor = pd.read_csv(
-                    arquivo, sep=None, engine="python", encoding="utf-8-sig"
-                )
-            # Persistir no cache pra aparecer na "Visão geral"
-            cache.salvar_df(f"sgcor:{tipo_relatorio}", df_sgcor)
-        except Exception as e:
-            mostrar_erro_amigavel("Não consegui ler o arquivo", e)
-    else:
-        # Se já tem cache desse tipo, mostra
-        df_cached = cache.buscar_df(f"sgcor:{tipo_relatorio}", ttl_segundos=ttl * 60)
-        if df_cached is not None:
-            df_sgcor = df_cached
-            st.caption("📌 Mostrando dados do último upload (em cache).")
-
-    if df_sgcor is not None and not df_sgcor.empty:
-        st.metric("Total de registros", len(df_sgcor))
-        st.dataframe(df_sgcor, use_container_width=True)
 
 # -------------------------------------------------------------
 # VISÃO GERAL

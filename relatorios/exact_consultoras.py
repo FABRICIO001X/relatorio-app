@@ -155,10 +155,15 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token Exact não configurado: {e}")
         return
 
-    chave = f"exact_consultoras_v1:{data_inicio}:{data_fim}"
-    dados = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+    chave_prop = f"exact_consultoras_propostas_v1:{data_inicio}:{data_fim}"
+    chave_ganhos = f"exact_consultoras_ganhos_v1:{data_inicio}:{data_fim}"
+    chave_bdr = f"exact_consultoras_bdr_v1:{data_inicio}:{data_fim}"
 
-    if dados is None:
+    df_prop = cache.buscar_df(chave_prop, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+    df_ganhos = cache.buscar_df(chave_ganhos, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+    df_bdr = cache.buscar_df(chave_bdr, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+
+    if df_prop is None or df_ganhos is None or df_bdr is None:
         # === 1) Propostas enviadas no período ===
         with st.spinner("Buscando propostas enviadas no período..."):
             try:
@@ -270,16 +275,21 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                     "dias_parado": dias_parado,
                 })
 
-        dados = {
-            "propostas": pd.DataFrame(rows_prop),
-            "ganhos": pd.DataFrame(rows_ganhos),
-            "bdr_atraso": pd.DataFrame(rows_bdr),
-        }
-        cache.salvar_df(chave, dados)
+        df_prop = pd.DataFrame(rows_prop)
+        df_ganhos = pd.DataFrame(rows_ganhos)
+        df_bdr = pd.DataFrame(rows_bdr)
 
-    df_prop = dados.get("propostas", pd.DataFrame())
-    df_ganhos = dados.get("ganhos", pd.DataFrame())
-    df_bdr = dados.get("bdr_atraso", pd.DataFrame())
+        cache.salvar_df(chave_prop, df_prop)
+        cache.salvar_df(chave_ganhos, df_ganhos)
+        cache.salvar_df(chave_bdr, df_bdr)
+
+    # Garantir que são DataFrames (não None)
+    if df_prop is None:
+        df_prop = pd.DataFrame()
+    if df_ganhos is None:
+        df_ganhos = pd.DataFrame()
+    if df_bdr is None:
+        df_bdr = pd.DataFrame()
 
     # =========================================================
     # CARDS por consultora

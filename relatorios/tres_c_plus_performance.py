@@ -1,11 +1,14 @@
 """
-Dashboard 3C Plus — produtividade dos operadores e resultados das ligações.
+Dashboard 3C Plus — produtividade dos operadores via /qualification/statistics.
 
-Foco: SDRs ativas (IASMIM, CRISLANE, JENNYFER, DANIELE, LAIANE, LAYLA).
+Abordagem: usar o endpoint agregado /qualification/statistics?agent_id=X
+em vez de paginar todas as chamadas (376 mil/mês). Super rápido (~5s).
+
+Foco: IASMIM, CRISLANE, JENNYFER, DANIELE, LAIANE, LAYLA.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -16,7 +19,7 @@ from connectors.tres_c_plus import TresCPlusClient, TresCPlusError
 from db import cache
 
 
-# Mapa nome amigável → id no 3C Plus (validado em 27/05/2026)
+# IDs no 3C Plus (validado em 27/05/2026)
 SDRS_3C_PLUS = {
     "IASMIM": 123722,
     "CRISLANE": 200133,
@@ -26,67 +29,24 @@ SDRS_3C_PLUS = {
     "LAYLA": 183640,
 }
 
-# Mapeamento reverso: padrões no campo 'agent' (email) → nome amigável
-# Como o campo `agent` da chamada vem como email/nome, fazemos match parcial
-EMAIL_TO_NOME = {
-    "iasmim": "IASMIM",
-    "crislane": "CRISLANE",
-    "jennyfer": "JENNYFER",
-    "daniele": "DANIELE",
-    "laiane": "LAIANE",
-    "layla": "LAYLA",
-}
-
-
-def _normalizar_agent(agent_str: str | None) -> str | None:
-    """Converte o campo 'agent' da chamada num nome amigável de SDR."""
-    if not agent_str or agent_str == "-":
-        return None
-    s = agent_str.lower()
-    for chave, nome in EMAIL_TO_NOME.items():
-        if chave in s:
-            return nome
-    return None  # não é uma das nossas SDRs
-
-
-def _hms_para_segundos(hms: str | None) -> int:
-    """Converte 'HH:MM:SS' em segundos."""
-    if not hms or hms == "-":
-        return 0
-    try:
-        partes = hms.split(":")
-        if len(partes) == 3:
-            return int(partes[0]) * 3600 + int(partes[1]) * 60 + int(partes[2])
-        if len(partes) == 2:
-            return int(partes[0]) * 60 + int(partes[1])
-    except (ValueError, AttributeError):
-        pass
-    return 0
-
-
-def _segundos_para_hms(segundos: float) -> str:
-    """Formata segundos em 'HH:MM:SS'."""
-    if pd.isna(segundos) or segundos <= 0:
-        return "00:00:00"
-    s = int(segundos)
-    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
-
 
 # =============================================================
 # Renderização
 # =============================================================
 def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: bool):
     st.markdown("### 📞 3C Plus — Performance dos operadores")
+    nomes_sdrs = list(SDRS_3C_PLUS.keys())
     st.caption(
-        f"SDRs ativos | {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+        f"{' · '.join(nomes_sdrs)} | "
+        f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
     )
 
     with st.expander("ℹ️ Como o relatório conta as ligações"):
         st.markdown(
-            "- **Chamadas:** todas as ligações feitas pelo operador no período\n"
-            "- **Tempo em ligação:** soma de `speaking_time` (tempo falando com o cliente)\n"
-            "- **Tempo médio:** soma dividida pelo número de chamadas\n"
-            "- **Resultados:** vem de `/qualification/statistics` — agrupado por dia"
+            "- **Chamadas qualificadas:** todas as ligações que a SDR qualificou no período\n"
+            "- **Dias ativos:** quantos dias do período a SDR teve atividade\n"
+            "- **Resultados:** o que a SDR marcou cada chamada como "
+            "(Sem contato, Em negociação, Sem interesse, etc.)"
         )
 
     try:
@@ -95,215 +55,196 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token 3C Plus não configurado: {e}")
         return
 
-    chave = f"3cplus_v2:{data_inicio}:{data_fim}"
-    df_chamadas = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+    chave = f"3cplus_qual_v1:{data_inicio}:{data_fim}"
+    df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
-    if df_chamadas is None:
+    if df is None:
         start_str = f"{data_inicio.isoformat()} 00:00:00"
         end_str = f"{data_fim.isoformat()} 23:59:59"
 
-        with st.spinner(f"Buscando chamadas do 3C Plus..."):
+        # Buscar /qualification/statistics POR AGENTE (rápido, agregado)
+        rows = []
+        progress = st.progress(0, text="Buscando estatísticas por SDR...")
+        for i, (nome, agent_id) in enumerate(SDRS_3C_PLUS.items()):
+            progress.progress((i + 1) / len(SDRS_3C_PLUS), text=f"Buscando {nome}...")
             try:
-                chamadas = cliente.listar_chamadas(start_str, end_str)
+                dados = cliente.qualification_statistics(start_str, end_str, agent_id=agent_id)
             except TresCPlusError as e:
-                st.error(f"Erro ao buscar chamadas: {e}")
-                return
+                st.warning(f"Não consegui buscar {nome}: {e}")
+                continue
 
-        if not chamadas:
-            st.info("Nenhuma chamada no período.")
-            return
+            for dia in dados:
+                data_str = dia.get("date")
+                for q_id, q_data in (dia.get("qualifications") or {}).items():
+                    rows.append({
+                        "sdr": nome,
+                        "agent_id": agent_id,
+                        "dia": data_str,
+                        "resultado": q_data.get("name") or f"ID {q_id}",
+                        "quantidade": q_data.get("count") or 0,
+                    })
+        progress.empty()
 
-        # Converte pra DataFrame com colunas essenciais
-        df_chamadas = pd.DataFrame([{
-            "id": c.get("id"),
-            "data_hora": c.get("call_date"),
-            "agent": c.get("agent"),
-            "campaign": c.get("campaign"),
-            "number": c.get("number"),
-            "speaking_seg": _hms_para_segundos(c.get("speaking_time")),
-            "acw_seg": _hms_para_segundos(c.get("acw_time")),
-            "list": c.get("list"),
-        } for c in chamadas])
+        df = pd.DataFrame(rows)
+        cache.salvar_df(chave, df)
 
-        # Normalizar agent → SDR nome
-        df_chamadas["sdr"] = df_chamadas["agent"].apply(_normalizar_agent)
-        df_chamadas["data_hora"] = pd.to_datetime(df_chamadas["data_hora"], errors="coerce")
-        df_chamadas["dia"] = df_chamadas["data_hora"].dt.date
-
-        cache.salvar_df(chave, df_chamadas)
-    else:
-        df_chamadas["data_hora"] = pd.to_datetime(df_chamadas["data_hora"], errors="coerce")
-        df_chamadas["dia"] = df_chamadas["data_hora"].dt.date
-
-    st.caption(f"📊 {len(df_chamadas)} chamadas totais no período (de todos os operadores)")
-
-    # Filtrar só das SDRs alvo
-    df_sdrs = df_chamadas[df_chamadas["sdr"].notna()].copy()
-    st.caption(f"📊 {len(df_sdrs)} chamadas das SDRs alvo ({', '.join(SDRS_3C_PLUS.keys())})")
-
-    if df_sdrs.empty:
-        st.warning("Nenhuma chamada das SDRs alvo no período.")
+    if df.empty:
+        st.info("Nenhuma chamada qualificada no período.")
         return
 
     # =========================================================
-    # CARDS — uma coluna por SDR
+    # CARDS — 6 SDRs em 2 linhas × 3 colunas
     # =========================================================
     st.subheader("Produtividade por SDR")
 
     dias_periodo = (data_fim - data_inicio).days + 1
 
-    # Calcular pra cada SDR
-    cols = st.columns(3)
-    sdrs_ativas = list(SDRS_3C_PLUS.keys())
-    for i, nome in enumerate(sdrs_ativas[:3]):  # primeira linha: IASMIM, CRISLANE, JENNYFER
-        df_sdr = df_sdrs[df_sdrs["sdr"] == nome]
-        total_cham = len(df_sdr)
-        cham_por_dia = total_cham / dias_periodo if dias_periodo else 0
-        tempo_total = df_sdr["speaking_seg"].sum()
-        tempo_medio = df_sdr["speaking_seg"].mean() if total_cham else 0
+    def render_card_sdr(col, nome: str):
+        df_sdr = df[df["sdr"] == nome]
+        total_cham = int(df_sdr["quantidade"].sum())
+        dias_ativos = df_sdr["dia"].nunique()
+        cham_por_dia_ativo = total_cham / dias_ativos if dias_ativos else 0
 
-        with cols[i]:
+        with col:
             st.markdown(f"#### {nome}")
             c1, c2 = st.columns(2)
             c1.metric("Chamadas", total_cham)
-            c2.metric("Cham/dia", f"{cham_por_dia:.1f}")
+            c2.metric("Dias ativos", f"{dias_ativos}/{dias_periodo}")
             c3, c4 = st.columns(2)
-            c3.metric("Tempo total", _segundos_para_hms(tempo_total))
-            c4.metric("Tempo médio", _segundos_para_hms(tempo_medio))
+            c3.metric("Cham/dia ativo", f"{cham_por_dia_ativo:.0f}")
+            c4.metric("Cham/dia total", f"{(total_cham/dias_periodo):.0f}")
 
-    # Segunda linha: DANIELE, LAIANE, LAYLA
+    # Linha 1: IASMIM, CRISLANE, JENNYFER
+    cols1 = st.columns(3)
+    for i, nome in enumerate(nomes_sdrs[:3]):
+        render_card_sdr(cols1[i], nome)
+
+    # Linha 2: DANIELE, LAIANE, LAYLA
     cols2 = st.columns(3)
-    for i, nome in enumerate(sdrs_ativas[3:6]):
-        df_sdr = df_sdrs[df_sdrs["sdr"] == nome]
-        total_cham = len(df_sdr)
-        cham_por_dia = total_cham / dias_periodo if dias_periodo else 0
-        tempo_total = df_sdr["speaking_seg"].sum()
-        tempo_medio = df_sdr["speaking_seg"].mean() if total_cham else 0
-
-        with cols2[i]:
-            st.markdown(f"#### {nome}")
-            c1, c2 = st.columns(2)
-            c1.metric("Chamadas", total_cham)
-            c2.metric("Cham/dia", f"{cham_por_dia:.1f}")
-            c3, c4 = st.columns(2)
-            c3.metric("Tempo total", _segundos_para_hms(tempo_total))
-            c4.metric("Tempo médio", _segundos_para_hms(tempo_medio))
+    for i, nome in enumerate(nomes_sdrs[3:6]):
+        render_card_sdr(cols2[i], nome)
 
     st.divider()
 
     # =========================================================
-    # GRÁFICO — comparativo (chamadas + tempo)
+    # GRÁFICO — comparativo (total de chamadas por SDR)
     # =========================================================
     st.subheader("Comparativo entre SDRs")
 
-    dados_g = []
-    for nome in sdrs_ativas:
-        df_sdr = df_sdrs[df_sdrs["sdr"] == nome]
-        dados_g.append({
-            "SDR": nome,
-            "Chamadas": len(df_sdr),
-            "Tempo total (min)": round(df_sdr["speaking_seg"].sum() / 60, 1),
-        })
-    df_g = pd.DataFrame(dados_g)
-    if not df_g.empty:
-        df_long = df_g.melt(id_vars="SDR", var_name="Métrica", value_name="Valor")
-        fig = px.bar(
-            df_long, x="SDR", y="Valor", color="Métrica", barmode="group",
-            title="Chamadas e tempo total em ligação",
-            color_discrete_map={
-                "Chamadas": "#378ADD",
-                "Tempo total (min)": "#1D9E75",
-            },
-        )
-        st.plotly_chart(fig, use_container_width=True)
+    df_g = (
+        df.groupby("sdr")["quantidade"].sum()
+        .reindex(nomes_sdrs, fill_value=0)
+        .reset_index()
+        .rename(columns={"sdr": "SDR", "quantidade": "Chamadas"})
+    )
+    fig = px.bar(
+        df_g, x="SDR", y="Chamadas",
+        title="Total de chamadas qualificadas por SDR",
+        text="Chamadas",
+        color="SDR",
+        color_discrete_map={
+            "IASMIM": "#1D9E75",
+            "CRISLANE": "#378ADD",
+            "JENNYFER": "#E5A663",
+            "DANIELE": "#9C27B0",
+            "LAIANE": "#FF5722",
+            "LAYLA": "#607D8B",
+        },
+    )
+    fig.update_layout(showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
 
     # =========================================================
-    # GRÁFICO — resultados das ligações (qualifications)
+    # RESULTADOS DAS LIGAÇÕES — POR SDR INDIVIDUAL
     # =========================================================
-    st.subheader("Resultados das ligações")
+    st.subheader("📋 Resultados das ligações por SDR")
+    st.caption("Quantas vezes cada SDR teve cada resultado de chamada")
 
-    chave_q = f"3cplus_qualif_v2:{data_inicio}:{data_fim}"
-    df_q = cache.buscar_df(chave_q, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+    # Tabela cruzada: Resultado x SDR
+    pivot = (
+        df.groupby(["resultado", "sdr"])["quantidade"].sum()
+        .unstack(fill_value=0)
+    )
+    # Reordenar colunas seguindo SDRS_3C_PLUS
+    col_order = [c for c in nomes_sdrs if c in pivot.columns]
+    pivot = pivot[col_order]
+    # Adicionar coluna TOTAL
+    pivot["TOTAL"] = pivot.sum(axis=1)
+    # Ordenar linhas pelo TOTAL decrescente
+    pivot = pivot.sort_values("TOTAL", ascending=False)
+    # Adicionar linha TOTAL no final
+    total_row = pivot.sum(axis=0)
+    total_row.name = "TOTAL"
+    pivot = pd.concat([pivot, pd.DataFrame([total_row])])
 
-    if df_q is None:
-        start_str = f"{data_inicio.isoformat()} 00:00:00"
-        end_str = f"{data_fim.isoformat()} 23:59:59"
-        with st.spinner("Buscando qualificações..."):
-            try:
-                qualif = cliente.qualification_statistics(start_str, end_str)
-            except TresCPlusError as e:
-                st.warning(f"Não consegui buscar qualificações: {e}")
-                qualif = []
+    st.dataframe(pivot, use_container_width=True)
 
-        # Estrutura vem como [{date, qualifications: {id: {name, count}, ...}}]
-        rows_q = []
-        for d in qualif:
-            dia = d.get("date")
-            for q_id, q_data in (d.get("qualifications") or {}).items():
-                rows_q.append({
-                    "dia": dia,
-                    "resultado": q_data.get("name") or f"ID {q_id}",
-                    "quantidade": q_data.get("count") or 0,
-                })
-        df_q = pd.DataFrame(rows_q)
-        cache.salvar_df(chave_q, df_q)
+    # Gráfico empilhado horizontal
+    df_long = (
+        df.groupby(["resultado", "sdr"])["quantidade"].sum()
+        .reset_index()
+        .rename(columns={"resultado": "Resultado", "sdr": "SDR", "quantidade": "Quantidade"})
+    )
+    df_long = df_long[df_long["Quantidade"] > 0]
 
-    if df_q.empty:
-        st.info("Sem dados de qualificação no período.")
-    else:
-        # Agrupar por resultado (somar dias)
-        por_resultado = (
-            df_q.groupby("resultado")["quantidade"].sum()
-            .reset_index().sort_values("quantidade", ascending=True)
+    if not df_long.empty:
+        totais = df_long.groupby("Resultado")["Quantidade"].sum().sort_values(ascending=True)
+        df_long["Resultado"] = pd.Categorical(
+            df_long["Resultado"], categories=totais.index.tolist(), ordered=True
         )
         fig_q = px.bar(
-            por_resultado.tail(15), x="quantidade", y="resultado",
-            orientation="h",
-            title="Top 15 resultados das ligações no período",
-            text="quantidade",
+            df_long.sort_values("Resultado"), x="Quantidade", y="Resultado", color="SDR",
+            orientation="h", barmode="stack",
+            title="Resultados das ligações — empilhado por SDR",
+            color_discrete_map={
+                "IASMIM": "#1D9E75",
+                "CRISLANE": "#378ADD",
+                "JENNYFER": "#E5A663",
+                "DANIELE": "#9C27B0",
+                "LAIANE": "#FF5722",
+                "LAYLA": "#607D8B",
+            },
+            height=max(400, 30 * len(totais)),
         )
         st.plotly_chart(fig_q, use_container_width=True)
 
-        # Tabela completa
-        st.markdown("**Detalhamento por resultado**")
-        st.dataframe(
-            por_resultado.sort_values("quantidade", ascending=False),
-            use_container_width=True, hide_index=True,
-        )
-
     st.divider()
 
     # =========================================================
-    # TABELA — chamadas detalhadas
+    # EVOLUÇÃO DIÁRIA (linha do tempo)
     # =========================================================
-    st.subheader("Chamadas detalhadas")
+    st.subheader("📈 Evolução diária por SDR")
 
-    filtro_sdr = st.multiselect(
-        "Filtrar por SDR",
-        options=sdrs_ativas,
-        default=sdrs_ativas[:3],
+    df_dia = (
+        df.groupby(["dia", "sdr"])["quantidade"].sum()
+        .reset_index()
+        .rename(columns={"dia": "Dia", "sdr": "SDR", "quantidade": "Chamadas"})
     )
+    df_dia["Dia"] = pd.to_datetime(df_dia["Dia"])
+    df_dia = df_dia.sort_values("Dia")
 
-    df_t = df_sdrs[df_sdrs["sdr"].isin(filtro_sdr)].copy()
+    if not df_dia.empty:
+        fig_dia = px.line(
+            df_dia, x="Dia", y="Chamadas", color="SDR",
+            title="Chamadas por dia",
+            markers=True,
+            color_discrete_map={
+                "IASMIM": "#1D9E75",
+                "CRISLANE": "#378ADD",
+                "JENNYFER": "#E5A663",
+                "DANIELE": "#9C27B0",
+                "LAIANE": "#FF5722",
+                "LAYLA": "#607D8B",
+            },
+        )
+        st.plotly_chart(fig_dia, use_container_width=True)
 
-    df_t["Data/hora"] = df_t["data_hora"].dt.strftime("%d/%m/%Y %H:%M")
-    df_t["Tempo fala"] = df_t["speaking_seg"].apply(_segundos_para_hms)
-    df_view = df_t[[
-        "Data/hora", "sdr", "number", "campaign", "Tempo fala",
-    ]].rename(columns={
-        "sdr": "SDR",
-        "number": "Telefone",
-        "campaign": "Campanha",
-    }).sort_values("Data/hora", ascending=False)
-
-    st.caption(f"{len(df_view)} chamadas filtradas")
-    st.dataframe(df_view, use_container_width=True, hide_index=True)
-
-    csv = df_view.to_csv(index=False).encode("utf-8-sig")
+    # Download CSV
+    csv = pivot.to_csv().encode("utf-8-sig")
     st.download_button(
-        "📥 Baixar CSV", csv,
-        file_name=f"3cplus_chamadas_{data_inicio}_{data_fim}.csv",
-        mime="text/csv", key="dl_3c_chamadas",
+        "📥 Baixar tabela em CSV", csv,
+        file_name=f"3cplus_resultados_{data_inicio}_{data_fim}.csv",
+        mime="text/csv", key="dl_3c_resultados",
     )

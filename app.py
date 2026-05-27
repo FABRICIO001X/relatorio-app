@@ -117,60 +117,13 @@ with tab_3c:
 # EXACT
 # -------------------------------------------------------------
 with tab_exact:
-    st.subheader("Exact Sales")
-    try:
-        cliente_exact = ExactClient()
-        visao = st.selectbox(
-            "Visão",
-            [
-                "Leads (todos)",
-                "Leads vendidos",
-                "Leads descartados",
-                "Histórico de ligações",
-                "Reuniões",
-                "Dashboard - Desempenho de vendedores",
-                "Dashboard - Desempenho de pré-vendedores",
-                "Dashboard - Métricas de venda",
-            ],
-        )
-
-        chave_exact = f"exact:{visao}:{data_inicio}:{data_fim}"
-
-        def fetch_exact():
-            di, df_ = data_inicio, data_fim
-            if visao == "Leads (todos)":
-                return cliente_exact.listar_leads(top=500).get("value", [])
-            if visao == "Leads vendidos":
-                return cliente_exact.listar_leads_vendidos(top=500).get("value", [])
-            if visao == "Leads descartados":
-                return cliente_exact.listar_leads_descartados(top=500).get("value", [])
-            if visao == "Histórico de ligações":
-                return cliente_exact.historico_ligacoes(top=500).get("value", [])
-            if visao == "Reuniões":
-                return cliente_exact.listar_reunioes(top=500).get("value", [])
-            if visao == "Dashboard - Desempenho de vendedores":
-                return cliente_exact.dashboard_desempenho_vendedores(di, df_)
-            if visao == "Dashboard - Desempenho de pré-vendedores":
-                return cliente_exact.dashboard_desempenho_pre_vendedores(di, df_)
-            if visao == "Dashboard - Métricas de venda":
-                return cliente_exact.dashboard_metricas_venda(di, df_)
-            return []
-
-        df_exact = carregar_com_cache(chave_exact, fetch_exact, ttl)
-        if df_exact.empty:
-            st.info("Nenhum registro retornado nessa visão/período.")
-        else:
-            st.metric("Total de registros", len(df_exact))
-            st.dataframe(df_exact, use_container_width=True)
-
-            # gráfico genérico se houver coluna categórica
-            for col in ["status", "stage", "etapa", "situacao", "stageName", "funnelName"]:
-                if col in df_exact.columns:
-                    fig = px.histogram(df_exact, x=col, title=f"Distribuição por {col}")
-                    st.plotly_chart(fig, use_container_width=True)
-                    break
-    except ExactError as e:
-        mostrar_erro_amigavel("Falha ao consultar Exact", e)
+    from relatorios import exact_consultoras
+    exact_consultoras.renderizar(
+        data_inicio=data_inicio,
+        data_fim=data_fim,
+        ttl_minutos=ttl,
+        usar_cache=usar_cache,
+    )
 
 # -------------------------------------------------------------
 # SGCOR

@@ -230,7 +230,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v6:{data_inicio}:{data_fim}"
+    chave = f"sdr_v7:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -287,19 +287,18 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 descartes_info = {}
 
         # === 7) Montar DataFrame ===
-        # Após nova definição (v5), só precisamos de DUAS categorias no DataFrame:
-        # - 'cadastrado' (leads cadastrados no período) → contém info de status atual,
-        #   incluindo se estão em PROPOSTA ENVIADA, Descartado, etc.
-        # - 'ganho' (leads que mudaram pra NEGOCIO FECHADO no período, independente de cadastro)
-        # As métricas "Propostas enviadas" e "Descartados" são CALCULADAS a partir
-        # dos cadastrados, então não precisam de categoria própria.
+        # Após nova definição (v6), o DataFrame tem:
+        # - 'cadastrado' (leads cadastrados no período) → base pra Total, Em andamento,
+        #   Propostas enviadas, Descartados (filtrados por stage_atual)
+        # - 'ganho' (leads ganhos no período via updateDate, INDEPENDENTE de cadastro)
+        # Um mesmo lead pode aparecer em AMBAS categorias (cadastrado e ganho no mesmo mês).
+        # Isso é intencional: ganhos sempre conta tudo que fechou no período.
         rows = []
         ids_cadastrados = set()
         for lead in leads_cadastrados:
             sdr_id = primeira_sdr_por_lead.get(lead["id"])
             if sdr_id not in SDRS_FOCO:
                 continue
-            # Anexar info de descarte (só relevante pra leads cadastrados descartados)
             descarte = descartes_info.get(lead["id"])
             rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], descarte=descarte, categoria="cadastrado"))
             ids_cadastrados.add(lead["id"])
@@ -307,10 +306,6 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         for lead in leads_ganhos:
             sdr_id = primeira_sdr_por_lead.get(lead["id"])
             if sdr_id not in SDRS_FOCO:
-                continue
-            # Evita duplicar lead que já está como 'cadastrado' (caso ele tenha
-            # sido cadastrado E ganho no mesmo período)
-            if lead["id"] in ids_cadastrados:
                 continue
             rows.append(_montar_linha(lead, SDRS_FOCO[sdr_id], categoria="ganho"))
 

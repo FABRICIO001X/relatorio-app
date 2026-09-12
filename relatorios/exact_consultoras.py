@@ -350,6 +350,104 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.divider()
 
     # =========================================================
+    # RANKING + TAXA DE CONVERSÃO
+    # =========================================================
+    st.subheader("🏆 Ranking das consultoras")
+    st.caption(
+        "Taxa de conversão = ganhos ÷ propostas enviadas no período. "
+        "Ordenado por vendas fechadas."
+    )
+
+    rank_rows = []
+    for nome in NOMES_CONSULTORAS:
+        p = propostas_por.get(nome, 0)
+        g = ganhos_por.get(nome, 0)
+        conv = (g / p * 100) if p else 0.0
+        t = tempo_medio_por.get(nome)
+        rank_rows.append({
+            "Consultora": nome,
+            "Propostas": p,
+            "Ganhos": g,
+            "_conv": conv,
+            "Dias até fechar": f"{t:.0f}" if t is not None else "—",
+        })
+
+    df_rank = (
+        pd.DataFrame(rank_rows)
+        .sort_values(["Ganhos", "_conv"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+    medalhas = ["🥇", "🥈", "🥉"]
+    df_rank.insert(0, "#", [medalhas[i] if i < 3 else str(i + 1) for i in range(len(df_rank))])
+    df_rank_view = df_rank.copy()
+    df_rank_view["Conversão"] = df_rank_view["_conv"].apply(lambda x: f"{x:.1f}%")
+    df_rank_view = df_rank_view[
+        ["#", "Consultora", "Propostas", "Ganhos", "Conversão", "Dias até fechar"]
+    ]
+    st.dataframe(df_rank_view, use_container_width=True, hide_index=True)
+
+    if df_rank["_conv"].sum() > 0:
+        fig_conv = px.bar(
+            df_rank.sort_values("_conv"), x="_conv", y="Consultora", orientation="h",
+            text=df_rank.sort_values("_conv")["_conv"].apply(lambda x: f"{x:.1f}%"),
+            title="Taxa de conversão (proposta → ganho)",
+            labels={"_conv": "Conversão (%)"},
+            color="Consultora",
+            color_discrete_map={
+                "LAIANE": "#FF5722", "CARLA": "#9C27B0", "CAMILA": "#607D8B",
+                "DANIELE": "#E5A663", "LAYLA": "#378ADD",
+            },
+        )
+        fig_conv.update_layout(showlegend=False, height=320)
+        st.plotly_chart(fig_conv, use_container_width=True)
+
+    st.divider()
+
+    # =========================================================
+    # EVOLUÇÃO MENSAL DE VENDAS
+    # =========================================================
+    st.subheader("📅 Vendas por mês")
+
+    if df_ganhos.empty:
+        st.info("Nenhuma venda no período para montar a evolução mensal.")
+    else:
+        df_m = df_ganhos.copy()
+        df_m["dt"] = pd.to_datetime(df_m["data_ganho"], errors="coerce", utc=True)
+        df_m = df_m[df_m["dt"].notna()]
+        df_m["Mês"] = df_m["dt"].dt.strftime("%Y-%m")
+        mensal = (
+            df_m.groupby(["Mês", "consultora"]).size()
+            .reset_index(name="Vendas")
+            .rename(columns={"consultora": "Consultora"})
+            .sort_values("Mês")
+        )
+        if mensal.empty:
+            st.info("Sem vendas datadas no período.")
+        else:
+            fig_m = px.bar(
+                mensal, x="Mês", y="Vendas", color="Consultora", barmode="group",
+                title="Vendas fechadas por mês",
+                color_discrete_map={
+                    "LAIANE": "#FF5722", "CARLA": "#9C27B0", "CAMILA": "#607D8B",
+                    "DANIELE": "#E5A663", "LAYLA": "#378ADD",
+                },
+            )
+            st.plotly_chart(fig_m, use_container_width=True)
+
+            pivot_m = mensal.pivot(
+                index="Consultora", columns="Mês", values="Vendas"
+            ).fillna(0).astype(int)
+            pivot_m["TOTAL"] = pivot_m.sum(axis=1)
+            pivot_m = pivot_m.sort_values("TOTAL", ascending=False)
+            st.dataframe(pivot_m, use_container_width=True)
+            st.caption(
+                "Se aparecer só um mês, amplie o período na barra lateral "
+                "para comparar meses."
+            )
+
+    st.divider()
+
+    # =========================================================
     # ABAS DETALHADAS
     # =========================================================
     aba_prop, aba_ganho, aba_bdr, aba_tempo = st.tabs([

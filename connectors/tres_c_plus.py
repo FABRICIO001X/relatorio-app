@@ -69,6 +69,23 @@ class TresCPlusClient:
                 raise TresCPlusError(f"Falha de rede em {path}: {e}") from e
         raise TresCPlusError(f"Timeout em {path} após 2 tentativas: {ultimo_erro}")
 
+    def agent_statistics(
+        self,
+        start_date: str,
+        end_date: str,
+        agent_id: int | None = None,
+    ) -> list[dict]:
+        """Estatísticas diárias de contato por operador.
+
+        Endpoint /agent/statistics — agregado por dia, aceita agent_id.
+        Campos por dia: date, answered (atendidas), dmc, converted, unknown.
+        """
+        params: dict[str, Any] = {"start_date": start_date, "end_date": end_date}
+        if agent_id is not None:
+            params["agent_id"] = agent_id
+        resp = self._get("/agent/statistics", params=params)
+        return resp.get("data", []) if isinstance(resp, dict) else []
+
     def _get_paginado(
         self,
         path: str,

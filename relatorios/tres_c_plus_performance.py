@@ -213,6 +213,81 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.divider()
 
     # =========================================================
+    # CONTATO EFETIVO — chamadas atendidas por operador
+    # =========================================================
+    st.subheader("☎️ Contato efetivo")
+    st.caption(
+        "Chamadas realmente atendidas do outro lado — mede contato real, "
+        "não só volume de discagem."
+    )
+
+    chave_at = f"3cplus_atend_v1:{data_inicio}:{data_fim}"
+    df_at = cache.buscar_df(chave_at, ttl_segundos=ttl_minutos * 60) if usar_cache else None
+
+    if df_at is None:
+        start_str = f"{data_inicio.isoformat()} 00:00:00"
+        end_str = f"{data_fim.isoformat()} 23:59:59"
+        rows_at = []
+        prog = st.progress(0, text="Buscando contato efetivo...")
+        for i, (nome, agent_id) in enumerate(SDRS_3C_PLUS.items()):
+            prog.progress((i + 1) / len(SDRS_3C_PLUS), text=f"Buscando {nome}...")
+            try:
+                dados_at = cliente.agent_statistics(start_str, end_str, agent_id=agent_id)
+            except TresCPlusError:
+                continue
+            for dia in dados_at:
+                rows_at.append({
+                    "sdr": nome,
+                    "dia": dia.get("date"),
+                    "atendidas": dia.get("answered") or 0,
+                    "convertidas": dia.get("converted") or 0,
+                })
+        prog.empty()
+        df_at = pd.DataFrame(rows_at)
+        cache.salvar_df(chave_at, df_at)
+
+    if df_at.empty:
+        st.info("Sem dados de contato efetivo no período.")
+    else:
+        resumo_at = (
+            df_at.groupby("sdr")[["atendidas", "convertidas"]].sum()
+            .reindex(nomes_sdrs, fill_value=0)
+            .reset_index()
+        )
+        # Cruzar com o total de chamadas qualificadas pra ter a taxa
+        tot_cham = df.groupby("sdr")["quantidade"].sum().reindex(nomes_sdrs, fill_value=0)
+        resumo_at["chamadas"] = resumo_at["sdr"].map(tot_cham).fillna(0).astype(int)
+        resumo_at["taxa"] = resumo_at.apply(
+            lambda r: (r["atendidas"] / r["chamadas"] * 100) if r["chamadas"] else 0,
+            axis=1,
+        )
+
+        tab_at = resumo_at.rename(columns={
+            "sdr": "SDR",
+            "chamadas": "Chamadas",
+            "atendidas": "Atendidas",
+            "convertidas": "Convertidas",
+        })
+        tab_at["Taxa de atendimento"] = resumo_at["taxa"].apply(lambda x: f"{x:.1f}%")
+        tab_at = tab_at[["SDR", "Chamadas", "Atendidas", "Taxa de atendimento", "Convertidas"]]
+        st.dataframe(tab_at, use_container_width=True, hide_index=True)
+
+        if resumo_at["atendidas"].sum() > 0:
+            fig_at = px.bar(
+                resumo_at, x="sdr", y="atendidas", color="sdr", text="atendidas",
+                title="Chamadas atendidas por SDR",
+                labels={"atendidas": "Atendidas", "sdr": "SDR"},
+                color_discrete_map={
+                    "IASMIM": "#1D9E75", "CRISLANE": "#378ADD", "JENNYFER": "#E5A663",
+                    "DANIELE": "#9C27B0", "LAIANE": "#FF5722", "LAYLA": "#607D8B",
+                },
+            )
+            fig_at.update_layout(showlegend=False)
+            st.plotly_chart(fig_at, use_container_width=True)
+
+    st.divider()
+
+    # =========================================================
     # EVOLUÇÃO DIÁRIA (linha do tempo)
     # =========================================================
     st.subheader("📈 Evolução diária por SDR")

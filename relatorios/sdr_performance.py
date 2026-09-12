@@ -370,6 +370,52 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.divider()
 
     # =========================================================
+    # RANKING — quem mais converte
+    # =========================================================
+    st.subheader("🏆 Ranking de conversão")
+    st.caption("Ordenado pela taxa de conversão (ganhos ÷ leads cadastrados no período)")
+
+    rank_rows = []
+    for _sid, nome in SDRS_FOCO.items():
+        df_sdr = df[df["sdr_responsavel"] == nome]
+        df_cad = df_sdr[df_sdr["categoria"] == "cadastrado"].drop_duplicates("lead_id")
+        total_leads = len(df_cad)
+        ganhos = len(df_sdr[df_sdr["categoria"] == "ganho"].drop_duplicates("lead_id"))
+        propostas = int((df_cad["stage_atual"] == STAGE_PROPOSTA).sum())
+        conv = (ganhos / total_leads * 100) if total_leads else 0.0
+        rank_rows.append({
+            "SDR": nome,
+            "Leads": total_leads,
+            "Propostas": propostas,
+            "Ganhos": ganhos,
+            "_conv": conv,
+        })
+
+    df_rank = pd.DataFrame(rank_rows).sort_values("_conv", ascending=False).reset_index(drop=True)
+    medalhas = ["🥇", "🥈", "🥉"]
+    df_rank.insert(0, "#", [medalhas[i] if i < 3 else str(i + 1) for i in range(len(df_rank))])
+    df_view_rank = df_rank.copy()
+    df_view_rank["Conversão"] = df_view_rank["_conv"].apply(lambda x: f"{x:.1f}%")
+    df_view_rank = df_view_rank.drop(columns=["_conv"])
+    st.dataframe(df_view_rank, use_container_width=True, hide_index=True)
+
+    if df_rank["_conv"].sum() > 0:
+        fig_rank = px.bar(
+            df_rank.sort_values("_conv"), x="_conv", y="SDR", orientation="h",
+            text=df_rank.sort_values("_conv")["_conv"].apply(lambda x: f"{x:.1f}%"),
+            title="Taxa de conversão por SDR",
+            labels={"_conv": "Conversão (%)"},
+            color="SDR",
+            color_discrete_map={
+                "IASMIM": "#1D9E75", "CRISLANE": "#378ADD", "JENNYFER": "#E5A663",
+            },
+        )
+        fig_rank.update_layout(showlegend=False, height=280)
+        st.plotly_chart(fig_rank, use_container_width=True)
+
+    st.divider()
+
+    # =========================================================
     # GRÁFICO — comparativo
     # =========================================================
     dados = []

@@ -136,17 +136,83 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         if df.empty:
             st.info("Nenhuma apólice no período.")
         else:
+            # === Período anterior de mesma duração (para comparação) ===
+            dias_periodo = (data_fim - data_inicio).days + 1
+            ant_fim = data_inicio - timedelta(days=1)
+            ant_inicio = ant_fim - timedelta(days=dias_periodo - 1)
+
+            chave_ant = f"sgcor_producao:{ant_inicio}:{ant_fim}"
+            df_ant = (
+                cache.buscar_df(chave_ant, ttl_segundos=ttl_minutos * 60)
+                if usar_cache else None
+            )
+            if df_ant is None:
+                with st.spinner("Buscando período anterior para comparação..."):
+                    try:
+                        lista_ant = cliente.producao_pesquisar(
+                            tipo_data="dataVigenciaInicial",
+                            data_inicial=_to_iso(ant_inicio),
+                            data_final=_to_iso(ant_fim),
+                        )
+                        df_ant = pd.DataFrame(
+                            [_flatten_proposta(p) for p in lista_ant]
+                        )
+                        cache.salvar_df(chave_ant, df_ant)
+                    except SGCorError:
+                        df_ant = pd.DataFrame()
+
             # KPIs
             total = len(df)
             premio_total = df["premioTotal"].sum()
             comissao_total = df["comissao"].sum()
             ticket_medio = premio_total / total if total else 0
 
+            if df_ant is not None and not df_ant.empty:
+                total_ant = len(df_ant)
+                premio_ant = df_ant["premioTotal"].sum()
+                comissao_ant = df_ant["comissao"].sum()
+                ticket_ant = premio_ant / total_ant if total_ant else 0
+            else:
+                total_ant = premio_ant = comissao_ant = ticket_ant = 0
+
+            def _delta_pct(atual: float, anterior: float) -> str | None:
+                if not anterior:
+                    return None
+                return f"{((atual - anterior) / anterior * 100):+.1f}%"
+
+            st.caption(
+                f"Comparando com {ant_inicio.strftime('%d/%m/%Y')} a "
+                f"{ant_fim.strftime('%d/%m/%Y')} ({dias_periodo} dias)"
+            )
+
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Apólices", total)
-            c2.metric("Prêmio total", _fmt_brl(premio_total))
-            c3.metric("Comissão estimada", _fmt_brl(comissao_total))
-            c4.metric("Ticket médio", _fmt_brl(ticket_medio))
+            c1.metric("Apólices", total, delta=_delta_pct(total, total_ant))
+            c2.metric(
+                "Prêmio total", _fmt_brl(premio_total),
+                delta=_delta_pct(premio_total, premio_ant),
+            )
+            c3.metric(
+                "Comissão estimada", _fmt_brl(comissao_total),
+                delta=_delta_pct(comissao_total, comissao_ant),
+            )
+            c4.metric(
+                "Ticket médio", _fmt_brl(ticket_medio),
+                delta=_delta_pct(ticket_medio, ticket_ant),
+            )
+
+            if total_ant:
+                comp = pd.DataFrame([
+                    {"Período": "Anterior", "Apólices": total_ant, "Prêmio": premio_ant},
+                    {"Período": "Atual", "Apólices": total, "Prêmio": premio_total},
+                ])
+                fig_comp = px.bar(
+                    comp, x="Período", y="Prêmio", text=comp["Prêmio"].apply(_fmt_brl),
+                    title="Prêmio: período atual vs anterior",
+                    color="Período",
+                    color_discrete_map={"Anterior": "#94A3B8", "Atual": "#1E5BA8"},
+                )
+                fig_comp.update_layout(showlegend=False, height=300)
+                st.plotly_chart(fig_comp, use_container_width=True)
 
             # Gráfico por ramo
             if df["ramo"].notna().any():

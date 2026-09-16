@@ -5,7 +5,7 @@ CRITÉRIOS (definidos com usuário em 25/05/2026):
 - Total de leads = leads CADASTRADOS no período (registerDate)
 - Em andamento = leads cadastrados no período que NÃO são ganho nem descarte
 - Propostas = leads que AGORA estão com status 'PROPOSTA ENVIADA' (sem filtro de data)
-- Ganhos = leads que mudaram pra 'NEGOCIO FECHADO' no período (updateDate),
+- Ganhos = leads que mudaram pra 'NEGOCIO FECHADO' no período (data real do funil),
            INDEPENDENTE de quando foram cadastrados
 - Descartes = leads que mudaram pra 'Descartado' no período (updateDate),
               INDEPENDENTE de quando foram cadastrados
@@ -103,6 +103,62 @@ def _coletar_leads_atuais_propostas(
         if len(itens) < page_size:
             break
     return todos
+
+
+def _coletar_ganhos_data_real(
+    cliente: ExactClient,
+    data_inicio: date,
+    data_fim: date,
+    max_paginas: int = 30,
+    page_size: int = 500,
+) -> list[dict]:
+    """Leads que fecharam venda no período, pela DATA REAL do fechamento.
+
+    Usa /leadStages em vez do updateDate do lead: o updateDate é a última
+    mexida no cadastro, então uma venda antiga que alguém abriu depois
+    aparecia no mês errado.
+    """
+    di, df_ = data_inicio.isoformat(), data_fim.isoformat()
+    fechamentos: dict[int, str] = {}
+    for i in range(max_paginas):
+        params = {
+            "$top": page_size,
+            "$skip": i * page_size,
+            "$filter": f"destinationStage eq '{STAGE_GANHO}'",
+            "$orderby": "createdAt desc",
+        }
+        resp = cliente._get("/leadStages", params=params)
+        itens = resp.get("value", resp) if isinstance(resp, dict) else resp
+        if not itens:
+            break
+        passou = False
+        for st_ in itens:
+            d = (st_.get("createdAt") or "")[:10]
+            if d < di:
+                passou = True
+                break
+            if d > df_:
+                continue
+            lid = st_.get("leadId")
+            if lid is not None and lid not in fechamentos:
+                fechamentos[lid] = st_.get("createdAt")
+        if passou or len(itens) < page_size:
+            break
+
+    if not fechamentos:
+        return []
+
+    leads: list[dict] = []
+    ids = list(fechamentos.keys())
+    for i in range(0, len(ids), 25):
+        lote = ids[i : i + 25]
+        ids_str = ",".join(str(x) for x in lote)
+        resp = cliente._get("/Leads", params={"$filter": f"id in ({ids_str})", "$top": 25})
+        itens = resp.get("value", resp) if isinstance(resp, dict) else resp
+        for l in itens or []:
+            l["_data_venda"] = fechamentos.get(l["id"])
+            leads.append(l)
+    return leads
 
 
 def _coletar_transferencias_dos_leads(
@@ -230,7 +286,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v7:{data_inicio}:{data_fim}"
+    chave = f"sdr_v8:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -245,13 +301,11 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 return
 
         # === 2) Leads que viraram NEGOCIO FECHADO no período ===
-        # ÚNICA exceção: ganhos contam pelo updateDate, independente do registerDate
+        # Ganhos contam pela data REAL do fechamento, independente do registerDate
         with st.spinner("Buscando ganhos do período (independente da data de cadastro)..."):
             try:
-                leads_ganhos = _coletar_leads_filtrados(
-                    cliente, data_inicio, data_fim,
-                    campo_data="updateDate",
-                    filtro_extra=f"stage eq '{STAGE_GANHO}'",
+                leads_ganhos = _coletar_ganhos_data_real(
+                    cliente, data_inicio, data_fim
                 )
             except ExactError as e:
                 st.error(f"Erro ao buscar ganhos: {e}")
@@ -290,7 +344,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         # Após nova definição (v6), o DataFrame tem:
         # - 'cadastrado' (leads cadastrados no período) → base pra Total, Em andamento,
         #   Propostas enviadas, Descartados (filtrados por stage_atual)
-        # - 'ganho' (leads ganhos no período via updateDate, INDEPENDENTE de cadastro)
+        # - 'ganho' (leads ganhos no período pela data real do funil, INDEPENDENTE de cadastro)
         # Um mesmo lead pode aparecer em AMBAS categorias (cadastrado e ganho no mesmo mês).
         # Isso é intencional: ganhos sempre conta tudo que fechou no período.
         rows = []

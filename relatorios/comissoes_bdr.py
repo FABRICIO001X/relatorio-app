@@ -50,54 +50,6 @@ def _brl(valor: float) -> str:
 # =============================================================
 # Coleta
 # =============================================================
-def _coletar_stages_dos_leads(
-    cliente: ExactClient,
-    lead_ids: list[int],
-    lote_size: int = 25,
-) -> dict[int, list[dict]]:
-    """Histórico de etapas dos leads, agrupado por leadId (ordem cronológica)."""
-    por_lead: dict[int, list[dict]] = {}
-    for i in range(0, len(lead_ids), lote_size):
-        lote = lead_ids[i : i + lote_size]
-        ids_str = ",".join(str(x) for x in lote)
-        params = {
-            "$filter": f"leadId in ({ids_str})",
-            "$top": 500,
-            "$orderby": "createdAt asc",
-        }
-        resp = cliente._get("/leadStages", params=params)
-        itens = resp.get("value", resp) if isinstance(resp, dict) else resp
-        for s in itens or []:
-            por_lead.setdefault(s["leadId"], []).append(s)
-    return por_lead
-
-
-def _data_base_elegibilidade(
-    lead: dict,
-    stages: list[dict],
-) -> tuple[str, str]:
-    """Retorna (data_base_iso, tipo) para contar a janela de comissão.
-
-    Se o lead foi REATIVADO (saiu de SEM CONTATO) antes do fechamento,
-    a janela conta a partir da reativação — não do cadastro original.
-    Leads adormecidos que a equipe reativou geram comissão.
-    """
-    fechamento = None
-    for s in stages:
-        if s.get("destinationStage") == STAGE_GANHO:
-            fechamento = s.get("createdAt")
-
-    reativacao = None
-    for s in stages:
-        if s.get("originStage") == STAGE_SEM_CONTATO:
-            if fechamento is None or (s.get("createdAt") or "") < fechamento:
-                reativacao = s.get("createdAt")
-
-    if reativacao:
-        return reativacao, "reativado"
-    return lead.get("registerDate") or "", "novo"
-
-
 def _coletar_ganhos(
     cliente: ExactClient,
     data_inicio: date,
@@ -105,43 +57,79 @@ def _coletar_ganhos(
     max_paginas: int = 30,
     page_size: int = 500,
 ) -> list[dict]:
-    """Leads que estão em NEGOCIO FECHADO com updateDate dentro do período."""
-    todos: list[dict] = []
+    """Vendas fechadas no período, pela DATA REAL do fechamento.
+
+    Usa /leadStages (momento em que o lead entrou em NEGOCIO FECHADO) em vez do
+    updateDate do lead. O updateDate é a última mexida no cadastro — se alguém
+    abre ou edita o lead depois, ele pula de mês e a venda aparece no mês errado.
+    """
     di, df_ = data_inicio.isoformat(), data_fim.isoformat()
+
+    # 1) Fechamentos do período, pela data real
+    fechamentos: dict[int, str] = {}
     for i in range(max_paginas):
         params = {
             "$top": page_size,
             "$skip": i * page_size,
-            "$orderby": "updateDate desc",
-            "$filter": f"stage eq '{STAGE_GANHO}'",
+            "$filter": f"destinationStage eq '{STAGE_GANHO}'",
+            "$orderby": "createdAt desc",
         }
-        resp = cliente._get("/Leads", params=params)
+        resp = cliente._get("/leadStages", params=params)
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
         if not itens:
             break
         passou = False
-        for l in itens:
-            d = (l.get("updateDate") or "")[:10]
+        for st in itens:
+            d = (st.get("createdAt") or "")[:10]
             if d < di:
                 passou = True
                 break
             if d > df_:
                 continue
-            todos.append(l)
+            lid = st.get("leadId")
+            # desc: guarda o fechamento mais recente dentro do período
+            if lid is not None and lid not in fechamentos:
+                fechamentos[lid] = st.get("createdAt")
         if passou or len(itens) < page_size:
             break
-    return todos
+
+    if not fechamentos:
+        return []
+
+    # 2) Dados dos leads correspondentes
+    leads: list[dict] = []
+    ids = list(fechamentos.keys())
+    for i in range(0, len(ids), 25):
+        lote = ids[i : i + 25]
+        ids_str = ",".join(str(x) for x in lote)
+        resp = cliente._get("/Leads", params={"$filter": f"id in ({ids_str})", "$top": 25})
+        itens = resp.get("value", resp) if isinstance(resp, dict) else resp
+        for l in itens or []:
+            # sobrescreve com a data real da venda
+            l["_data_venda"] = fechamentos.get(l["id"])
+            leads.append(l)
+    return leads
 
 
-def _mapear_sdr(
+def _mapear_acao_sdr(
     cliente: ExactClient,
     lead_ids: set[int],
-    max_paginas: int = 50,
+    max_paginas: int = 60,
     page_size: int = 500,
-) -> dict[int, int]:
-    """Mapa {lead_id: sdr_id} pela PRIMEIRA transferência feita por uma SDR foco."""
-    primeira: dict[int, int] = {}
+) -> dict[int, dict]:
+    """Mapa {lead_id: {"sdr_id": ..., "data": ...}} com a ÚLTIMA ação de um BDR.
+
+    "Ação do BDR" = qualquer transferência em que ele aparece, seja mandando
+    o lead (origem) ou recebendo para qualificar (destino). É o único registro
+    do Exact que tem nome e data — o histórico de etapas não guarda o usuário.
+
+    Pega a ação MAIS RECENTE porque é ela que representa o toque do BDR que
+    destravou a venda. Um lead que o BDR passou meses atrás e que a consultora
+    fechou sozinha depois não gera comissão.
+    """
+    acoes: dict[int, dict] = {}
     sdr_ids = set(SDRS_FOCO.keys())
+
     for i in range(max_paginas):
         params = {
             "$top": page_size,
@@ -156,14 +144,18 @@ def _mapear_sdr(
             lid = t.get("leadId")
             if lid not in lead_ids:
                 continue
-            origin = t.get("originUserId")
-            if origin in sdr_ids and lid not in primeira:
-                primeira[lid] = origin
+            origem = t.get("originUserId")
+            destino = t.get("destinationUserId")
+            sdr_id = origem if origem in sdr_ids else (
+                destino if destino in sdr_ids else None
+            )
+            if sdr_id is None:
+                continue
+            # asc: a última gravada vence
+            acoes[lid] = {"sdr_id": sdr_id, "data": t.get("createdAt")}
         if len(itens) < page_size:
             break
-        if len(primeira) >= len(lead_ids):
-            break
-    return primeira
+    return acoes
 
 
 # =============================================================
@@ -202,16 +194,16 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.markdown(
             f"- **Base:** leads que fecharam venda (`{STAGE_GANHO}`) dentro do "
             "período selecionado na barra lateral\n"
-            f"- **Regra dos {janela_meses} meses:** a venda é elegível se o lead "
-            f"entrou em contato há no máximo **{janela_dias} dias** do fechamento\n"
-            "- **Lead novo:** conta a partir do cadastro\n"
-            "- **Lead reativado:** conta a partir da **reativação** — quando o lead "
-            f"saiu de `{STAGE_SEM_CONTATO}` e voltou a ser trabalhado. "
-            "Lead adormecido de meses atrás que a equipe reativou e fechou "
-            "**gera comissão**\n"
-            f"- **Valor:** {_brl(valor_comissao)} por venda elegível\n"
-            "- **BDR responsável:** quem fez a primeira transferência do lead "
-            "(inclui quem recebeu, qualificou e devolveu)"
+            "- **Ação do BDR:** a última transferência em que o BDR aparece — "
+            "mandando o lead para a consultora ou recebendo para qualificar. "
+            "É o único registro do Exact que guarda quem fez e quando\n"
+            f"- **Regra dos {janela_meses} meses:** paga se a ação do BDR foi há no "
+            f"máximo **{janela_dias} dias** do fechamento\n"
+            "- **Vale para qualquer etapa:** lead novo ou lead adormecido que o "
+            "BDR reativou — o que conta é ter havido ação dele perto da venda\n"
+            "- **Não paga** quando o BDR tocou no lead meses antes e a venda saiu "
+            "depois por trabalho da consultora\n"
+            f"- **Valor:** {_brl(valor_comissao)} por venda elegível"
         )
 
     try:
@@ -236,37 +228,25 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             return
 
         ids = {l["id"] for l in ganhos}
-        with st.spinner(f"Identificando o BDR de {len(ids)} vendas..."):
+        with st.spinner(f"Identificando a ação do BDR em {len(ids)} vendas..."):
             try:
-                sdr_por_lead = _mapear_sdr(cliente, ids)
+                acao_por_lead = _mapear_acao_sdr(cliente, ids)
             except ExactError as e:
                 st.error(f"Erro ao buscar transferências: {e}")
                 return
 
-        # Histórico de etapas: precisamos saber se o lead foi reativado
-        ids_com_bdr = [l["id"] for l in ganhos if sdr_por_lead.get(l["id"]) is not None]
-        with st.spinner("Verificando reativações..."):
-            try:
-                stages_por_lead = _coletar_stages_dos_leads(cliente, ids_com_bdr)
-            except ExactError as e:
-                st.error(f"Erro ao buscar histórico de etapas: {e}")
-                return
-
         rows = []
         for l in ganhos:
-            sdr_id = sdr_por_lead.get(l["id"])
-            if sdr_id is None:
-                continue  # venda sem BDR foco — não entra na comissão
-            stages = stages_por_lead.get(l["id"], [])
-            data_base, tipo = _data_base_elegibilidade(l, stages)
+            acao = acao_por_lead.get(l["id"])
+            if acao is None:
+                continue  # venda sem ação de BDR — não entra na comissão
             rows.append({
                 "lead_id": l["id"],
                 "lead_nome": l.get("lead"),
-                "bdr": SDRS_FOCO[sdr_id],
+                "bdr": SDRS_FOCO[acao["sdr_id"]],
                 "data_cadastro": l.get("registerDate"),
-                "data_base": data_base,
-                "tipo_lead": tipo,
-                "data_ganho": l.get("updateDate"),
+                "data_base": acao["data"],
+                "data_ganho": l.get("_data_venda") or l.get("updateDate"),
             })
 
         df = pd.DataFrame(rows)
@@ -282,7 +262,6 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     df["dt_ganho"] = pd.to_datetime(df["data_ganho"], errors="coerce", utc=True)
     if "data_base" not in df.columns:
         df["data_base"] = df["data_cadastro"]
-        df["tipo_lead"] = "novo"
     df["dt_base"] = pd.to_datetime(df["data_base"], errors="coerce", utc=True)
     df["dt_base"] = df["dt_base"].fillna(df["dt_cadastro"])
     df["dias_ate_fechar"] = (df["dt_ganho"] - df["dt_base"]).dt.days
@@ -296,18 +275,17 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     # Resumo geral
     # =========================================================
-    reativados_ok = int((elegiveis["tipo_lead"] == "reativado").sum()) \
-        if "tipo_lead" in elegiveis.columns else 0
-
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("Vendas no período", total_vendas)
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric(
+        "Vendas com BDR", total_vendas,
+        help="Vendas do período em que algum BDR teve ação registrada",
+    )
     k2.metric("Elegíveis ✅", len(elegiveis))
     k3.metric(
-        "Por reativação ♻️", reativados_ok,
-        help="Leads adormecidos que a equipe reativou e fechou dentro da janela",
+        "Fora da janela ❌", len(fora),
+        help="A ação do BDR foi antiga demais em relação ao fechamento",
     )
-    k4.metric("Fora da janela ❌", len(fora))
-    k5.metric("Total a pagar", _brl(valor_total))
+    k4.metric("Total a pagar", _brl(valor_total))
 
     st.divider()
 
@@ -366,21 +344,18 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     def montar_tabela(d: pd.DataFrame) -> pd.DataFrame:
         v = d.copy()
         v["Cadastrado"] = v["dt_cadastro"].dt.strftime("%d/%m/%Y")
-        v["Contato"] = v["dt_base"].dt.strftime("%d/%m/%Y")
+        v["Ação do BDR"] = v["dt_base"].dt.strftime("%d/%m/%Y")
         v["Fechado"] = v["dt_ganho"].dt.strftime("%d/%m/%Y")
-        v["Tipo"] = v.get("tipo_lead", "novo").map(
-            {"reativado": "♻️ Reativado", "novo": "🆕 Novo"}
-        ).fillna("🆕 Novo")
         return v[[
-            "bdr", "lead_nome", "Tipo", "Cadastrado", "Contato",
+            "bdr", "lead_nome", "Cadastrado", "Ação do BDR",
             "Fechado", "dias_ate_fechar",
         ]].rename(
             columns={
                 "bdr": "BDR",
                 "lead_nome": "Lead",
-                "dias_ate_fechar": "Dias até fechar",
+                "dias_ate_fechar": "Dias da ação até fechar",
             }
-        ).sort_values("Dias até fechar")
+        ).sort_values("Dias da ação até fechar")
 
     with aba_ok:
         filtro = st.multiselect(
@@ -403,8 +378,8 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     with aba_fora:
         st.caption(
-            f"Vendas fechadas no período cujo último contato (cadastro ou "
-            f"reativação) foi há mais de {janela_dias} dias — não geram comissão."
+            f"Vendas em que a última ação do BDR foi há mais de {janela_dias} "
+            "dias do fechamento — a venda saiu por trabalho da consultora."
         )
         if fora.empty:
             st.success("Nenhuma venda ficou fora da janela.")

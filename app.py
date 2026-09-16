@@ -212,9 +212,9 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-tab_visao, tab_sdrs, tab_3c, tab_exact, tab_com, tab_sgcor = st.tabs(
-    ["📈 Visão geral", "👥 SDRs", "📞 3C Plus", "🎯 Consultoras",
-     "💰 Comissões BDR", "📑 SGCor"]
+tab_visao, tab_meta, tab_sdrs, tab_3c, tab_exact, tab_com, tab_sgcor = st.tabs(
+    ["📈 Visão geral", "🎯 Meta semanal", "👥 SDRs", "📞 3C Plus",
+     "🏅 Consultoras", "💰 Comissões BDR", "📑 SGCor"]
 )
 
 params = dict(
@@ -227,6 +227,10 @@ params = dict(
 with tab_visao:
     from relatorios import visao_geral
     visao_geral.renderizar(**params)
+
+with tab_meta:
+    from relatorios import meta_semanal_bdr
+    meta_semanal_bdr.renderizar(**params)
 
 with tab_sdrs:
     from relatorios import sdr_performance

@@ -85,38 +85,35 @@ def _contar_leads_novos(cliente: ExactClient, dia: date) -> int:
     return total
 
 
-def _comissao_do_mes(cliente: ExactClient) -> tuple[int, float]:
-    """Vendas elegíveis do mês corrente e valor total de comissão."""
-    hoje = date.today()
-    inicio_mes = hoje.replace(day=1)
-    elegiveis = 0
+def _vendas_do_mes(cliente: ExactClient) -> int:
+    """Vendas fechadas no mês corrente, pela DATA REAL do fechamento.
+
+    Usa /leadStages: o updateDate do lead é a última mexida no cadastro e faz
+    venda antiga aparecer no mês errado.
+    """
+    inicio_mes = date.today().replace(day=1).isoformat()
+    ids = set()
     for i in range(10):
         params = {
             "$top": 500,
             "$skip": i * 500,
-            "$orderby": "updateDate desc",
-            "$filter": f"stage eq '{STAGE_GANHO}'",
+            "$filter": f"destinationStage eq '{STAGE_GANHO}'",
+            "$orderby": "createdAt desc",
         }
-        resp = cliente._get("/Leads", params=params)
+        resp = cliente._get("/leadStages", params=params)
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
         if not itens:
             break
         parou = False
-        for l in itens:
-            d = (l.get("updateDate") or "")[:10]
-            if d < inicio_mes.isoformat():
+        for s_ in itens:
+            d = (s_.get("createdAt") or "")[:10]
+            if d < inicio_mes:
                 parou = True
                 break
-            try:
-                cad = pd.to_datetime(l.get("registerDate"), utc=True)
-                gan = pd.to_datetime(l.get("updateDate"), utc=True)
-                if (gan - cad).days <= JANELA_DIAS:
-                    elegiveis += 1
-            except (TypeError, ValueError):
-                continue
+            ids.add(s_.get("leadId"))
         if parou or len(itens) < 500:
             break
-    return elegiveis, elegiveis * VALOR_COMISSAO
+    return len(ids)
 
 
 def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: bool):
@@ -137,9 +134,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 dados["leads_hoje"] = _contar_leads_novos(ex, hoje)
                 dados["propostas_hoje"] = _contar_leadstages(ex, STAGE_PROPOSTA, hoje)
                 dados["ganhos_hoje"] = _contar_leadstages(ex, STAGE_GANHO, hoje)
-                vendas_mes, valor_mes = _comissao_do_mes(ex)
-                dados["vendas_mes"] = vendas_mes
-                dados["comissao_mes"] = valor_mes
+                dados["vendas_mes"] = _vendas_do_mes(ex)
         except ExactError as e:
             dados["erro_exact"] = str(e)
 
@@ -189,18 +184,16 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     st.markdown(f"### 💰 Mês de {hoje.strftime('%m/%Y')}")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Vendas elegíveis", dados.get("vendas_mes", "—"))
-    comissao = dados.get("comissao_mes")
-    m2.metric("Comissão a pagar", _brl(comissao) if comissao is not None else "—")
-    m3.metric(
+    m1, m2 = st.columns(2)
+    m1.metric(
+        "Vendas fechadas", dados.get("vendas_mes", "—"),
+        help="Pela data real do fechamento no funil",
+    )
+    m2.metric(
         "Contato efetivo hoje", dados.get("atendidas_hoje", "—"),
         help="Chamadas realmente atendidas do outro lado",
     )
-    st.caption(
-        f"Comissão: {_brl(VALOR_COMISSAO)} por venda com lead cadastrado há no "
-        f"máximo {JANELA_DIAS} dias. Detalhes na aba Comissões BDR."
-    )
+    st.caption("O valor de comissão a pagar está na aba Comissões BDR.")
 
     # --- Avisos de erro, se houver ---
     if dados.get("erro_exact"):

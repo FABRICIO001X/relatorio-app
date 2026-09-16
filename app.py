@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
 
+import auth
 from db import cache
 
 load_dotenv()
@@ -145,59 +146,92 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # =============================================================
+# Login
+# =============================================================
+usuario = auth.exigir_login()
+is_admin = auth.eh_admin(usuario)
+
+# =============================================================
 # Sidebar
 # =============================================================
 with st.sidebar:
     st.markdown("# 🛡️ Salute")
-    st.caption("Relatórios consolidados · 3C Plus · Exact · SGCor")
+    if is_admin:
+        st.caption("Relatórios consolidados · 3C Plus · Exact · SGCor")
+    else:
+        st.caption("Meta semanal")
+
+    st.markdown(f"**{usuario['nome']}**")
+    if st.button("Sair", use_container_width=True):
+        auth.sair()
 
     st.divider()
 
-    st.markdown("### 📅 Período")
     hoje = date.today()
 
-    atalho = st.radio(
-        "Atalhos",
-        ["Últimos 7 dias", "Últimos 30 dias", "Este mês", "Personalizado"],
-        index=1,
-        label_visibility="collapsed",
-    )
-
-    if atalho == "Últimos 7 dias":
-        ini_pad, fim_pad = hoje - timedelta(days=6), hoje
-    elif atalho == "Últimos 30 dias":
-        ini_pad, fim_pad = hoje - timedelta(days=29), hoje
-    elif atalho == "Este mês":
-        ini_pad, fim_pad = hoje.replace(day=1), hoje
-    else:
-        ini_pad, fim_pad = hoje - timedelta(days=29), hoje
-
-    if atalho == "Personalizado":
-        data_inicio = st.date_input("Data início", value=ini_pad, format="DD/MM/YYYY")
-        data_fim = st.date_input("Data fim", value=fim_pad, format="DD/MM/YYYY")
-    else:
-        data_inicio, data_fim = ini_pad, fim_pad
-        st.caption(
-            f"De {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+    if is_admin:
+        st.markdown("### 📅 Período")
+        atalho = st.radio(
+            "Atalhos",
+            ["Últimos 7 dias", "Últimos 30 dias", "Este mês", "Personalizado"],
+            index=1,
+            label_visibility="collapsed",
         )
 
-    if data_inicio > data_fim:
-        st.error("Data início precisa ser menor ou igual à data fim")
-        st.stop()
+        if atalho == "Últimos 7 dias":
+            ini_pad, fim_pad = hoje - timedelta(days=6), hoje
+        elif atalho == "Últimos 30 dias":
+            ini_pad, fim_pad = hoje - timedelta(days=29), hoje
+        elif atalho == "Este mês":
+            ini_pad, fim_pad = hoje.replace(day=1), hoje
+        else:
+            ini_pad, fim_pad = hoje - timedelta(days=29), hoje
 
-    st.divider()
-    st.markdown("### ⚙️ Dados")
-    usar_cache = st.checkbox("Usar cache (mais rápido)", value=True)
-    ttl = st.slider("Validade do cache (min)", 1, 240, 60)
+        if atalho == "Personalizado":
+            data_inicio = st.date_input("Data início", value=ini_pad, format="DD/MM/YYYY")
+            data_fim = st.date_input("Data fim", value=fim_pad, format="DD/MM/YYYY")
+        else:
+            data_inicio, data_fim = ini_pad, fim_pad
+            st.caption(
+                f"De {data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
+            )
 
-    if st.button("🔄 Atualizar dados", use_container_width=True):
-        cache.limpar()
-        st.success("Cache limpo — recarregando")
-        st.rerun()
+        if data_inicio > data_fim:
+            st.error("Data início precisa ser menor ou igual à data fim")
+            st.stop()
+
+        st.divider()
+        st.markdown("### ⚙️ Dados")
+        usar_cache = st.checkbox("Usar cache (mais rápido)", value=True)
+        ttl = st.slider("Validade do cache (min)", 1, 240, 60)
+        if st.button("🔄 Atualizar dados", use_container_width=True):
+            cache.limpar()
+            st.success("Cache limpo — recarregando")
+            st.rerun()
+    else:
+        # BDR: a aba Meta semanal tem seletor próprio de semana
+        data_inicio, data_fim = hoje - timedelta(days=29), hoje
+        usar_cache, ttl = True, 30
+        if st.button("🔄 Atualizar", use_container_width=True):
+            cache.limpar()
+            st.rerun()
 
 # =============================================================
-# Cabeçalho
+# Conteúdo
 # =============================================================
+params = dict(
+    data_inicio=data_inicio,
+    data_fim=data_fim,
+    ttl_minutos=ttl,
+    usar_cache=usar_cache,
+)
+
+if not is_admin:
+    # Perfil BDR: só a meta semanal
+    from relatorios import meta_semanal_bdr
+    meta_semanal_bdr.renderizar(**params)
+    st.stop()
+
 st.markdown(
     f"""
     <div style='padding: 0 0 1.2rem 0;'>
@@ -215,13 +249,6 @@ st.markdown(
 tab_visao, tab_meta, tab_sdrs, tab_3c, tab_exact, tab_com, tab_sgcor = st.tabs(
     ["📈 Visão geral", "🎯 Meta semanal", "👥 SDRs", "📞 3C Plus",
      "🏅 Consultoras", "💰 Comissões BDR", "📑 SGCor"]
-)
-
-params = dict(
-    data_inicio=data_inicio,
-    data_fim=data_fim,
-    ttl_minutos=ttl,
-    usar_cache=usar_cache,
 )
 
 with tab_visao:

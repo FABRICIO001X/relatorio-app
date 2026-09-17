@@ -113,48 +113,46 @@ def _coletar_ganhos(
 
 def _mapear_acao_sdr(
     cliente: ExactClient,
-    lead_ids: set[int],
-    max_paginas: int = 60,
-    page_size: int = 500,
+    leads: list[dict],
 ) -> dict[int, dict]:
-    """Mapa {lead_id: {"sdr_id": ..., "data": ...}} com a ÚLTIMA ação de um BDR.
+    """Mapa {lead_id: {"sdr_id", "data", "tipo"}} com a ÚLTIMA ação de um BDR
+    antes do fechamento, lida na linha do tempo do lead.
 
-    "Ação do BDR" = qualquer transferência em que ele aparece, seja mandando
-    o lead (origem) ou recebendo para qualificar (destino). É o único registro
-    do Exact que tem nome e data — o histórico de etapas não guarda o usuário.
+    Ações que contam (todas ficam registradas com o usuário que fez):
+    - "Lead cadastrado"  → BDR trouxe o lead (novo)
+    - "Lead recuperado"  → BDR reativou lead adormecido/descartado
+    - "Lead transferido" → BDR recebeu para qualificar e passou adiante
 
-    Pega a ação MAIS RECENTE porque é ela que representa o toque do BDR que
-    destravou a venda. Um lead que o BDR passou meses atrás e que a consultora
-    fechou sozinha depois não gera comissão.
+    Pega a mais recente antes da venda: é o toque do BDR que destravou o
+    fechamento. Lead que o BDR trouxe meses atrás e a consultora fechou
+    sozinha depois não gera comissão.
     """
     acoes: dict[int, dict] = {}
-    sdr_ids = set(SDRS_FOCO.keys())
-
-    for i in range(max_paginas):
-        params = {
-            "$top": page_size,
-            "$skip": i * page_size,
-            "$orderby": "createdAt asc",
-        }
-        resp = cliente._get("/transferHistory", params=params)
+    for l in leads:
+        lid = l["id"]
+        venda = l.get("_data_venda") or l.get("updateDate") or ""
+        try:
+            resp = cliente._get(f"/ListTimeline/{lid}")
+        except ExactError:
+            continue
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
-        if not itens:
-            break
-        for t in itens:
-            lid = t.get("leadId")
-            if lid not in lead_ids:
+        ultima = None
+        for ev in sorted(itens or [], key=lambda x: x.get("createdAt") or ""):
+            quando = ev.get("createdAt") or ""
+            if venda and quando > venda:
+                break
+            uid = (ev.get("user") or {}).get("id")
+            if uid not in SDRS_FOCO:
                 continue
-            origem = t.get("originUserId")
-            destino = t.get("destinationUserId")
-            sdr_id = origem if origem in sdr_ids else (
-                destino if destino in sdr_ids else None
-            )
-            if sdr_id is None:
-                continue
-            # asc: a última gravada vence
-            acoes[lid] = {"sdr_id": sdr_id, "data": t.get("createdAt")}
-        if len(itens) < page_size:
-            break
+            txt = (ev.get("text") or "").lower()
+            if "lead cadastrado" in txt:
+                ultima = {"sdr_id": uid, "data": quando, "tipo": "novo"}
+            elif "lead recuperado" in txt:
+                ultima = {"sdr_id": uid, "data": quando, "tipo": "recuperado"}
+            elif "lead transferido" in txt:
+                ultima = {"sdr_id": uid, "data": quando, "tipo": "transferido"}
+        if ultima:
+            acoes[lid] = ultima
     return acoes
 
 
@@ -194,9 +192,9 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.markdown(
             f"- **Base:** leads que fecharam venda (`{STAGE_GANHO}`) dentro do "
             "período selecionado na barra lateral\n"
-            "- **Ação do BDR:** a última transferência em que o BDR aparece — "
-            "mandando o lead para a consultora ou recebendo para qualificar. "
-            "É o único registro do Exact que guarda quem fez e quando\n"
+            "- **Ação do BDR:** a última vez, antes da venda, que o BDR "
+            "**cadastrou**, **recuperou** ou **transferiu** o lead — tudo fica "
+            "na linha do tempo com o nome de quem fez\n"
             f"- **Regra dos {janela_meses} meses:** paga se a ação do BDR foi há no "
             f"máximo **{janela_dias} dias** do fechamento\n"
             "- **Vale para qualquer etapa:** lead novo ou lead adormecido que o "
@@ -212,7 +210,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"comissoes_bdr_v1:{data_inicio}:{data_fim}"
+    chave = f"comissoes_bdr_v2:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -227,10 +225,9 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             st.info("Nenhuma venda fechada no período.")
             return
 
-        ids = {l["id"] for l in ganhos}
-        with st.spinner(f"Identificando a ação do BDR em {len(ids)} vendas..."):
+        with st.spinner(f"Lendo a linha do tempo de {len(ganhos)} vendas..."):
             try:
-                acao_por_lead = _mapear_acao_sdr(cliente, ids)
+                acao_por_lead = _mapear_acao_sdr(cliente, ganhos)
             except ExactError as e:
                 st.error(f"Erro ao buscar transferências: {e}")
                 return
@@ -244,6 +241,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 "lead_id": l["id"],
                 "lead_nome": l.get("lead"),
                 "bdr": SDRS_FOCO[acao["sdr_id"]],
+                "tipo": acao.get("tipo", "novo"),
                 "data_cadastro": l.get("registerDate"),
                 "data_base": acao["data"],
                 "data_ganho": l.get("_data_venda") or l.get("updateDate"),
@@ -346,8 +344,12 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         v["Cadastrado"] = v["dt_cadastro"].dt.strftime("%d/%m/%Y")
         v["Ação do BDR"] = v["dt_base"].dt.strftime("%d/%m/%Y")
         v["Fechado"] = v["dt_ganho"].dt.strftime("%d/%m/%Y")
+        v["Tipo"] = v.get("tipo", "novo").map(
+            {"novo": "🆕 Cadastrou", "recuperado": "♻️ Recuperou",
+             "transferido": "↔️ Qualificou"}
+        ).fillna("🆕 Cadastrou")
         return v[[
-            "bdr", "lead_nome", "Cadastrado", "Ação do BDR",
+            "bdr", "lead_nome", "Tipo", "Cadastrado", "Ação do BDR",
             "Fechado", "dias_ate_fechar",
         ]].rename(
             columns={

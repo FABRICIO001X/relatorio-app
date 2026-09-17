@@ -43,10 +43,11 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     with st.expander("ℹ️ Como o relatório conta as ligações"):
         st.markdown(
-            "- **Chamadas qualificadas:** todas as ligações que a SDR qualificou no período\n"
-            "- **Dias ativos:** quantos dias do período a SDR teve atividade\n"
-            "- **Resultados:** o que a SDR marcou cada chamada como "
-            "(Sem contato, Em negociação, Sem interesse, etc.)"
+            "- **Ligações:** todas as chamadas que a pessoa qualificou no período\n"
+            "- **Atendidas:** quantas o cliente atendeu do outro lado (contato real)\n"
+            "- **Viraram lead:** quantas ela marcou como *RD Station* — o sinal de "
+            "que o cliente tem interesse e vai pro Exact\n"
+            "- **Ligações por dia:** média só nos dias em que ela trabalhou"
         )
 
     try:
@@ -55,7 +56,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token 3C Plus não configurado: {e}")
         return
 
-    chave = f"3cplus_qual_v1:{data_inicio}:{data_fim}"
+    chave = f"3cplus_qual_v2:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -93,66 +94,167 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         return
 
     # =========================================================
-    # CARDS — 6 SDRs em 2 linhas × 3 colunas
+    # ATENDIDAS (contato efetivo) — buscar antes dos cards
     # =========================================================
-    st.subheader("Produtividade por SDR")
+    chave_at = f"3cplus_atend_v1:{data_inicio}:{data_fim}"
+    df_at = cache.buscar_df(chave_at, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
+    if df_at is None:
+        start_str = f"{data_inicio.isoformat()} 00:00:00"
+        end_str = f"{data_fim.isoformat()} 23:59:59"
+        rows_at = []
+        prog = st.progress(0, text="Buscando contato efetivo...")
+        for i, (nome, agent_id) in enumerate(SDRS_3C_PLUS.items()):
+            prog.progress((i + 1) / len(SDRS_3C_PLUS), text=f"Buscando {nome}...")
+            try:
+                dados_at = cliente.agent_statistics(start_str, end_str, agent_id=agent_id)
+            except TresCPlusError:
+                continue
+            for dia in dados_at:
+                rows_at.append({
+                    "sdr": nome,
+                    "dia": dia.get("date"),
+                    "atendidas": dia.get("answered") or 0,
+                    "convertidas": dia.get("converted") or 0,
+                })
+        prog.empty()
+        df_at = pd.DataFrame(rows_at)
+        cache.salvar_df(chave_at, df_at)
+
+    # ---------- Números-base por pessoa ----------
     dias_periodo = (data_fim - data_inicio).days + 1
+    BDRS = ["IASMIM", "CRISLANE", "JENNYFER"]
+    CONSULTORAS = ["DANIELE", "LAIANE", "LAYLA"]
+    RD = "RD STATION"
 
-    def render_card_sdr(col, nome: str):
-        df_sdr = df[df["sdr"] == nome]
-        total_cham = int(df_sdr["quantidade"].sum())
-        dias_ativos = df_sdr["dia"].nunique()
-        cham_por_dia_ativo = total_cham / dias_ativos if dias_ativos else 0
+    def base(nome: str) -> dict:
+        d = df[df["sdr"] == nome]
+        total = int(d["quantidade"].sum())
+        dias = int(d["dia"].nunique())
+        rd = int(d.loc[d["resultado"] == RD, "quantidade"].sum())
+        atend = 0
+        if not df_at.empty:
+            atend = int(df_at.loc[df_at["sdr"] == nome, "atendidas"].sum())
+        return {
+            "total": total,
+            "dias": dias,
+            "por_dia": (total / dias) if dias else 0.0,
+            "atend": atend,
+            "pct_atend": (atend / total * 100) if total else 0.0,
+            "rd": rd,
+            "pct_rd": (rd / total * 100) if total else 0.0,
+            "pct_rd_atend": (rd / atend * 100) if atend else 0.0,
+        }
 
+    dados = {n: base(n) for n in BDRS + CONSULTORAS}
+
+    # ---------- Resumo em uma frase ----------
+    bdrs_com_dados = [n for n in BDRS if dados[n]["total"] > 0]
+    if bdrs_com_dados:
+        mais_volume = max(bdrs_com_dados, key=lambda n: dados[n]["por_dia"])
+        mais_aprov = max(bdrs_com_dados, key=lambda n: dados[n]["pct_rd"])
+        if mais_volume == mais_aprov:
+            frase = (
+                f"**{mais_volume}** lidera em volume "
+                f"({dados[mais_volume]['por_dia']:.0f} ligações/dia) e em aproveitamento "
+                f"({dados[mais_volume]['pct_rd']:.1f}% das ligações viram lead)."
+            )
+        else:
+            frase = (
+                f"**{mais_volume}** lidera em volume "
+                f"({dados[mais_volume]['por_dia']:.0f} ligações/dia); "
+                f"**{mais_aprov}** lidera em aproveitamento "
+                f"({dados[mais_aprov]['pct_rd']:.1f}% das ligações viram lead)."
+            )
+        st.info(frase)
+
+    # =========================================================
+    # BDRs — funil de prospecção
+    # =========================================================
+    st.subheader("BDRs — prospecção no discador")
+    st.caption(
+        "Cada card é um funil: quantas ligações → quantas o cliente atendeu → "
+        "quantas viraram lead (RD Station). O % é sobre o total de ligações."
+    )
+
+    cols = st.columns(3)
+    for col, nome in zip(cols, BDRS):
+        b = dados[nome]
         with col:
             st.markdown(f"#### {nome}")
-            c1, c2 = st.columns(2)
-            c1.metric("Chamadas", total_cham)
-            c2.metric("Dias ativos", f"{dias_ativos}/{dias_periodo}")
-            c3, c4 = st.columns(2)
-            c3.metric("Cham/dia ativo", f"{cham_por_dia_ativo:.0f}")
-            c4.metric("Cham/dia total", f"{(total_cham/dias_periodo):.0f}")
-
-    # Linha 1: IASMIM, CRISLANE, JENNYFER
-    cols1 = st.columns(3)
-    for i, nome in enumerate(nomes_sdrs[:3]):
-        render_card_sdr(cols1[i], nome)
-
-    # Linha 2: DANIELE, LAIANE, LAYLA
-    cols2 = st.columns(3)
-    for i, nome in enumerate(nomes_sdrs[3:6]):
-        render_card_sdr(cols2[i], nome)
+            st.metric(
+                "Ligações por dia", f"{b['por_dia']:.0f}",
+                help=f"{b['total']} ligações em {b['dias']} dias ativos "
+                     f"(de {dias_periodo} no período)",
+            )
+            st.metric(
+                "Atendidas", f"{b['atend']:,}".replace(",", "."),
+                delta=f"{b['pct_atend']:.0f}% das ligações",
+                delta_color="off",
+            )
+            st.metric(
+                "Viraram lead", b["rd"],
+                delta=f"{b['pct_rd']:.1f}% das ligações",
+                delta_color="off",
+                help=f"{b['pct_rd_atend']:.0f}% das que foram atendidas",
+            )
 
     st.divider()
 
     # =========================================================
-    # GRÁFICO — comparativo (total de chamadas por SDR)
+    # Consultoras — atendimento
     # =========================================================
-    st.subheader("Comparativo entre SDRs")
+    st.subheader("Consultoras — atendimento a leads")
+    st.caption(
+        "Elas ligam para quem já é lead, então o volume é naturalmente menor. "
+        "Não compare com as BDRs."
+    )
 
-    df_g = (
-        df.groupby("sdr")["quantidade"].sum()
-        .reindex(nomes_sdrs, fill_value=0)
-        .reset_index()
-        .rename(columns={"sdr": "SDR", "quantidade": "Chamadas"})
-    )
-    fig = px.bar(
-        df_g, x="SDR", y="Chamadas",
-        title="Total de chamadas qualificadas por SDR",
-        text="Chamadas",
-        color="SDR",
-        color_discrete_map={
-            "IASMIM": "#1D9E75",
-            "CRISLANE": "#378ADD",
-            "JENNYFER": "#E5A663",
-            "DANIELE": "#9C27B0",
-            "LAIANE": "#FF5722",
-            "LAYLA": "#607D8B",
-        },
-    )
-    fig.update_layout(showlegend=False)
-    st.plotly_chart(fig, use_container_width=True)
+    cols = st.columns(3)
+    for col, nome in zip(cols, CONSULTORAS):
+        b = dados[nome]
+        with col:
+            st.markdown(f"#### {nome}")
+            a, c = st.columns(2)
+            a.metric("Ligações", f"{b['total']:,}".replace(",", "."))
+            c.metric("Dias ativos", f"{b['dias']}/{dias_periodo}")
+            st.metric(
+                "Atendidas", f"{b['atend']:,}".replace(",", "."),
+                delta=f"{b['pct_atend']:.0f}%" if b["total"] else None,
+                delta_color="off",
+            )
+
+    st.divider()
+
+    # =========================================================
+    # GRÁFICO — funil das BDRs lado a lado
+    # =========================================================
+    st.subheader("Funil das BDRs")
+
+    rows_f = []
+    for nome in BDRS:
+        b = dados[nome]
+        rows_f += [
+            {"BDR": nome, "Etapa": "Ligações", "Qtd": b["total"]},
+            {"BDR": nome, "Etapa": "Atendidas", "Qtd": b["atend"]},
+            {"BDR": nome, "Etapa": "Viraram lead", "Qtd": b["rd"]},
+        ]
+    df_f = pd.DataFrame(rows_f)
+    if df_f["Qtd"].sum() > 0:
+        fig = px.bar(
+            df_f, x="BDR", y="Qtd", color="Etapa", barmode="group", text="Qtd",
+            title="Ligações → Atendidas → Leads, por BDR",
+            color_discrete_map={
+                "Ligações": "#CBD5E1", "Atendidas": "#378ADD", "Viraram lead": "#1D9E75",
+            },
+            log_y=True,
+        )
+        fig.update_layout(yaxis_title="Quantidade (escala log)")
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Escala logarítmica: as barras ficam comparáveis mesmo com 8.000 "
+            "ligações e 50 leads no mesmo gráfico."
+        )
 
     st.divider()
 
@@ -209,81 +311,6 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             height=max(400, 30 * len(totais)),
         )
         st.plotly_chart(fig_q, use_container_width=True)
-
-    st.divider()
-
-    # =========================================================
-    # CONTATO EFETIVO — chamadas atendidas por operador
-    # =========================================================
-    st.subheader("☎️ Contato efetivo")
-    st.caption(
-        "Chamadas realmente atendidas do outro lado — mede contato real, "
-        "não só volume de discagem."
-    )
-
-    chave_at = f"3cplus_atend_v1:{data_inicio}:{data_fim}"
-    df_at = cache.buscar_df(chave_at, ttl_segundos=ttl_minutos * 60) if usar_cache else None
-
-    if df_at is None:
-        start_str = f"{data_inicio.isoformat()} 00:00:00"
-        end_str = f"{data_fim.isoformat()} 23:59:59"
-        rows_at = []
-        prog = st.progress(0, text="Buscando contato efetivo...")
-        for i, (nome, agent_id) in enumerate(SDRS_3C_PLUS.items()):
-            prog.progress((i + 1) / len(SDRS_3C_PLUS), text=f"Buscando {nome}...")
-            try:
-                dados_at = cliente.agent_statistics(start_str, end_str, agent_id=agent_id)
-            except TresCPlusError:
-                continue
-            for dia in dados_at:
-                rows_at.append({
-                    "sdr": nome,
-                    "dia": dia.get("date"),
-                    "atendidas": dia.get("answered") or 0,
-                    "convertidas": dia.get("converted") or 0,
-                })
-        prog.empty()
-        df_at = pd.DataFrame(rows_at)
-        cache.salvar_df(chave_at, df_at)
-
-    if df_at.empty:
-        st.info("Sem dados de contato efetivo no período.")
-    else:
-        resumo_at = (
-            df_at.groupby("sdr")[["atendidas", "convertidas"]].sum()
-            .reindex(nomes_sdrs, fill_value=0)
-            .reset_index()
-        )
-        # Cruzar com o total de chamadas qualificadas pra ter a taxa
-        tot_cham = df.groupby("sdr")["quantidade"].sum().reindex(nomes_sdrs, fill_value=0)
-        resumo_at["chamadas"] = resumo_at["sdr"].map(tot_cham).fillna(0).astype(int)
-        resumo_at["taxa"] = resumo_at.apply(
-            lambda r: (r["atendidas"] / r["chamadas"] * 100) if r["chamadas"] else 0,
-            axis=1,
-        )
-
-        tab_at = resumo_at.rename(columns={
-            "sdr": "SDR",
-            "chamadas": "Chamadas",
-            "atendidas": "Atendidas",
-            "convertidas": "Convertidas",
-        })
-        tab_at["Taxa de atendimento"] = resumo_at["taxa"].apply(lambda x: f"{x:.1f}%")
-        tab_at = tab_at[["SDR", "Chamadas", "Atendidas", "Taxa de atendimento", "Convertidas"]]
-        st.dataframe(tab_at, use_container_width=True, hide_index=True)
-
-        if resumo_at["atendidas"].sum() > 0:
-            fig_at = px.bar(
-                resumo_at, x="sdr", y="atendidas", color="sdr", text="atendidas",
-                title="Chamadas atendidas por SDR",
-                labels={"atendidas": "Atendidas", "sdr": "SDR"},
-                color_discrete_map={
-                    "IASMIM": "#1D9E75", "CRISLANE": "#378ADD", "JENNYFER": "#E5A663",
-                    "DANIELE": "#9C27B0", "LAIANE": "#FF5722", "LAYLA": "#607D8B",
-                },
-            )
-            fig_at.update_layout(showlegend=False)
-            st.plotly_chart(fig_at, use_container_width=True)
 
     st.divider()
 

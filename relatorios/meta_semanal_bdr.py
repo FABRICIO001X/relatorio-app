@@ -69,21 +69,23 @@ def _rotulo_semana(segunda: date) -> str:
 # =============================================================
 # Coleta
 # =============================================================
-def _coletar_leads_cadastrados(
+def _coletar_leads_com_atividade(
     cliente: ExactClient,
     inicio: datetime,
     fim: datetime,
-    max_paginas: int = 20,
+    max_paginas: int = 30,
     page_size: int = 500,
 ) -> list[dict]:
-    """Leads cadastrados (registerDate) dentro da janela."""
+    """Leads que tiveram atividade na janela (updateDate), o que cobre
+    tanto cadastros novos quanto recuperações de leads antigos."""
     ini_iso, fim_iso = inicio.isoformat(), fim.isoformat()
     resultado: list[dict] = []
+    vistos = set()
     for i in range(max_paginas):
         params = {
             "$top": page_size,
             "$skip": i * page_size,
-            "$orderby": "registerDate desc",
+            "$orderby": "updateDate desc",
         }
         resp = cliente._get("/Leads", params=params)
         itens = resp.get("value", resp) if isinstance(resp, dict) else resp
@@ -91,30 +93,49 @@ def _coletar_leads_cadastrados(
             break
         passou = False
         for l in itens:
-            quando = l.get("registerDate") or ""
+            quando = l.get("updateDate") or ""
             if quando < ini_iso:
                 passou = True
                 break
-            if quando > fim_iso:
+            if l["id"] in vistos:
                 continue
+            vistos.add(l["id"])
             resultado.append(l)
         if passou or len(itens) < page_size:
             break
     return resultado
 
 
-def _quem_cadastrou(cliente: ExactClient, lead_id: int) -> tuple[int | None, str | None]:
-    """Devolve (user_id, data) do evento 'Lead cadastrado' na linha do tempo."""
+def _acoes_da_bdr(
+    cliente: ExactClient, lead_id: int, inicio_iso: str, fim_iso: str
+) -> list[dict]:
+    """Eventos de VISITA MARCADA pela BDR dentro da janela, pela linha do tempo.
+
+    Conta dois eventos, os dois registrados com o usuário que fez:
+    - "Lead cadastrado"  → lead novo
+    - "Lead recuperado"  → lead adormecido/descartado que a BDR reativou
+    """
     try:
         resp = cliente._get(f"/ListTimeline/{lead_id}")
     except ExactError:
-        return None, None
+        return []
     itens = resp.get("value", resp) if isinstance(resp, dict) else resp
-    eventos = sorted(itens or [], key=lambda x: x.get("createdAt") or "")
-    for ev in eventos:
-        if "cadastrad" in (ev.get("text") or "").lower():
-            return (ev.get("user") or {}).get("id"), ev.get("createdAt")
-    return None, None
+    out = []
+    for ev in itens or []:
+        quando = ev.get("createdAt") or ""
+        if not (inicio_iso <= quando <= fim_iso):
+            continue
+        txt = (ev.get("text") or "").lower()
+        uid = (ev.get("user") or {}).get("id")
+        if uid not in BDRS:
+            continue
+        if "lead cadastrado" in txt:
+            out.append({"bdr": BDRS[uid], "quando": quando, "tipo": "novo"})
+        elif "lead recuperado" in txt:
+            out.append({"bdr": BDRS[uid], "quando": quando, "tipo": "recuperado"})
+        elif "lead transferido" in txt:
+            out.append({"bdr": BDRS[uid], "quando": quando, "tipo": "transferido"})
+    return out
 
 
 def _coletar_propostas(
@@ -179,9 +200,10 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     with st.expander("ℹ️ Como a meta é apurada"):
         st.markdown(
-            "- **Visita marcada:** lead cadastrado pela BDR na semana — manual "
-            "ou pelo discador. A BDR cadastra e passa na hora, então cadastro "
-            "= visita marcada\n"
+            "- **Visita marcada:** lead que a BDR **cadastrou** (novo), "
+            "**recuperou** (adormecido que ela reativou) ou **qualificou** "
+            "(recebeu e passou adiante) na semana — tudo registrado com o nome "
+            "dela na linha do tempo\n"
             f"- **Semana de marcação:** {segunda.strftime('%d/%m')} (segunda) a "
             f"{(segunda + timedelta(days=4)).strftime('%d/%m')} (sexta)\n"
             f"- **Apuração:** {(segunda + timedelta(days=7)).strftime('%d/%m')} "
@@ -198,33 +220,32 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"meta_semanal_v2:{segunda}:{corte.date()}"
+    chave = f"meta_semanal_v3:{segunda}:{corte.date()}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
-        with st.spinner("Buscando leads cadastrados na semana..."):
+        with st.spinner("Buscando leads com atividade na semana..."):
             try:
-                leads = _coletar_leads_cadastrados(cliente, inicio_janela, sexta_fim)
+                leads = _coletar_leads_com_atividade(cliente, inicio_janela, sexta_fim)
             except ExactError as e:
                 st.error(f"Erro ao buscar leads: {e}")
                 return
 
         if not leads:
-            st.info("Nenhum lead cadastrado nessa semana.")
+            st.info("Nenhum lead com atividade nessa semana.")
             return
 
-        # Quem cadastrou cada lead (linha do tempo) — só interessa BDR
-        prog = st.progress(0, text="Identificando quem cadastrou cada lead...")
-        cadastrados: list[tuple[dict, str, str]] = []  # (lead, bdr, quando)
+        ini_iso, fim_iso = inicio_janela.isoformat(), sexta_fim.isoformat()
+        prog = st.progress(0, text="Lendo a linha do tempo de cada lead...")
+        cadastrados: list[tuple[dict, str, str, str]] = []  # (lead, bdr, quando, tipo)
         for i, l in enumerate(leads):
             prog.progress((i + 1) / len(leads))
-            uid, quando = _quem_cadastrou(cliente, l["id"])
-            if uid in BDRS:
-                cadastrados.append((l, BDRS[uid], quando or l.get("registerDate") or ""))
+            for ac in _acoes_da_bdr(cliente, l["id"], ini_iso, fim_iso):
+                cadastrados.append((l, ac["bdr"], ac["quando"], ac["tipo"]))
         prog.empty()
 
         if not cadastrados:
-            st.info("Nenhum lead cadastrado por BDR nessa semana.")
+            st.info("Nenhuma visita marcada por BDR nessa semana.")
             return
 
         with st.spinner("Verificando quais viraram proposta..."):
@@ -235,9 +256,16 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 return
 
         corte_iso = corte.isoformat()
+        # Uma visita por lead/BDR na semana; cadastro/recuperação vence transferência
+        prioridade = {"novo": 0, "recuperado": 0, "transferido": 1}
+        cadastrados.sort(key=lambda x: (x[0]["id"], x[1], prioridade.get(x[3], 9), x[2]))
         rows = []
-        for lead, bdr, quando in cadastrados:
+        vistos_v = set()
+        for lead, bdr, quando, tipo in cadastrados:
             lead_id = lead["id"]
+            if (lead_id, bdr) in vistos_v:
+                continue
+            vistos_v.add((lead_id, bdr))
             datas_prop = [
                 p for p in propostas.get(lead_id, [])
                 if quando < p <= corte_iso
@@ -248,6 +276,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 "lead_id": lead_id,
                 "lead_nome": lead.get("lead") or f"Lead {lead_id}",
                 "marcada_em": quando,
+                "tipo": tipo,
                 "origem": (lead.get("source") or {}).get("value"),
                 "para": (lead.get("sdr") or {}).get("name"),
                 "converteu": converteu,
@@ -359,11 +388,11 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         v["Proposta em"] = pd.to_datetime(v["proposta_em"], errors="coerce").dt.strftime("%d/%m %H:%M")
         v["Proposta em"] = v["Proposta em"].fillna("—")
         v["Status"] = v["converteu"].map({True: "✅ Virou proposta", False: "⏳ Ainda não"})
-        v["Origem"] = v["origem"].map(
-            lambda o: "📞 Discador" if o == "3cplus" else "✍️ Manual"
-        )
+        v["Tipo"] = v["tipo"].map({
+            "novo": "🆕 Novo", "recuperado": "♻️ Recuperado", "transferido": "↔️ Qualificado",
+        })
         v = v[[
-            "bdr", "lead_nome", "Origem", "para", "Marcada em", "Status",
+            "bdr", "lead_nome", "Tipo", "para", "Marcada em", "Status",
             "Proposta em", "etapa_atual",
         ]].rename(columns={
             "bdr": "BDR",

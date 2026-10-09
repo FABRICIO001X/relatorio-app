@@ -5,6 +5,10 @@ Abordagem: usar o endpoint agregado /qualification/statistics?agent_id=X
 em vez de paginar todas as chamadas (376 mil/mês). Super rápido (~5s).
 
 Foco: IASMIM, CRISLANE, JENNYFER, DANIELE, LAIANE, LAYLA.
+
+TROCA DE PESSOA (06/10/2026): o agente 200133 é a CRISLANE até 18/09/2026 e a
+MELISSA a partir de 19/09/2026 — ver relatorios/pessoas.py. Como as estatísticas
+vêm por dia, cada dia é atribuído a quem estava no login naquele dia.
 """
 from __future__ import annotations
 
@@ -17,6 +21,7 @@ import streamlit as st
 
 from connectors.tres_c_plus import TresCPlusClient, TresCPlusError
 from db import cache
+from relatorios import pessoas
 
 
 # IDs no 3C Plus (validado em 27/05/2026)
@@ -35,7 +40,7 @@ SDRS_3C_PLUS = {
 # =============================================================
 def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: bool):
     st.markdown("### 📞 3C Plus — Performance dos operadores")
-    nomes_sdrs = list(SDRS_3C_PLUS.keys())
+    nomes_sdrs = pessoas.nomes_no_periodo(list(SDRS_3C_PLUS.keys()), data_inicio, data_fim)
     st.caption(
         f"{' · '.join(nomes_sdrs)} | "
         f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
@@ -56,7 +61,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token 3C Plus não configurado: {e}")
         return
 
-    chave = f"3cplus_qual_v2:{data_inicio}:{data_fim}"
+    chave = f"3cplus_qual_v3:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -78,7 +83,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 data_str = dia.get("date")
                 for q_id, q_data in (dia.get("qualifications") or {}).items():
                     rows.append({
-                        "sdr": nome,
+                        "sdr": pessoas.nome_no_dia(nome, data_str),
                         "agent_id": agent_id,
                         "dia": data_str,
                         "resultado": q_data.get("name") or f"ID {q_id}",
@@ -96,7 +101,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     # ATENDIDAS (contato efetivo) — buscar antes dos cards
     # =========================================================
-    chave_at = f"3cplus_atend_v1:{data_inicio}:{data_fim}"
+    chave_at = f"3cplus_atend_v2:{data_inicio}:{data_fim}"
     df_at = cache.buscar_df(chave_at, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df_at is None:
@@ -112,7 +117,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 continue
             for dia in dados_at:
                 rows_at.append({
-                    "sdr": nome,
+                    "sdr": pessoas.nome_no_dia(nome, dia.get("date")),
                     "dia": dia.get("date"),
                     "atendidas": dia.get("answered") or 0,
                     "convertidas": dia.get("converted") or 0,
@@ -123,7 +128,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     # ---------- Números-base por pessoa ----------
     dias_periodo = (data_fim - data_inicio).days + 1
-    BDRS = ["IASMIM", "CRISLANE", "JENNYFER"]
+    BDRS = pessoas.nomes_no_periodo(["IASMIM", "CRISLANE", "JENNYFER"], data_inicio, data_fim)
     CONSULTORAS = ["DANIELE", "LAIANE", "LAYLA"]
     RD = "RD STATION"
 
@@ -177,7 +182,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         "quantas viraram lead (RD Station). O % é sobre o total de ligações."
     )
 
-    cols = st.columns(3)
+    cols = st.columns(len(BDRS))
     for col, nome in zip(cols, BDRS):
         b = dados[nome]
         with col:
@@ -300,14 +305,14 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             df_long.sort_values("Resultado"), x="Quantidade", y="Resultado", color="SDR",
             orientation="h", barmode="stack",
             title="Resultados das ligações — empilhado por SDR",
-            color_discrete_map={
+            color_discrete_map=pessoas.cores({
                 "IASMIM": "#1D9E75",
                 "CRISLANE": "#378ADD",
                 "JENNYFER": "#E5A663",
                 "DANIELE": "#9C27B0",
                 "LAIANE": "#FF5722",
                 "LAYLA": "#607D8B",
-            },
+            }),
             height=max(400, 30 * len(totais)),
         )
         st.plotly_chart(fig_q, use_container_width=True)
@@ -332,14 +337,14 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             df_dia, x="Dia", y="Chamadas", color="SDR",
             title="Chamadas por dia",
             markers=True,
-            color_discrete_map={
+            color_discrete_map=pessoas.cores({
                 "IASMIM": "#1D9E75",
                 "CRISLANE": "#378ADD",
                 "JENNYFER": "#E5A663",
                 "DANIELE": "#9C27B0",
                 "LAIANE": "#FF5722",
                 "LAYLA": "#607D8B",
-            },
+            }),
         )
         st.plotly_chart(fig_dia, use_container_width=True)
 

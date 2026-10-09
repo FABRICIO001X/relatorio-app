@@ -9,6 +9,10 @@ REGRA (definida com o usuário em 11/09/2026):
 
 SDR responsável: quem fez a primeira transferência do lead (transferHistory),
 mesmo critério já usado na aba SDRs.
+
+TROCA DE PESSOA (06/10/2026): o login 442056 é da CRISLANE até 18/09/2026 e da
+MELISSA a partir de 19/09/2026 — ver relatorios/pessoas.py. A comissão vai para
+quem fez a AÇÃO no lead: o nome segue a data da ação do BDR.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ import streamlit as st
 
 from connectors.exact import ExactClient, ExactError
 from db import cache
+from relatorios import pessoas
 
 SDRS_FOCO = {
     436128: "IASMIM",
@@ -161,6 +166,7 @@ def _mapear_acao_sdr(
 # =============================================================
 def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: bool):
     st.markdown("### 💰 Comissões dos BDRs")
+    nomes_bdrs = pessoas.nomes_no_periodo(NOMES_SDRS, data_inicio, data_fim)
     st.caption(
         f"Vendas fechadas de {data_inicio.strftime('%d/%m/%Y')} "
         f"a {data_fim.strftime('%d/%m/%Y')}"
@@ -210,7 +216,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"comissoes_bdr_v2:{data_inicio}:{data_fim}"
+    chave = f"comissoes_bdr_v3:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -240,7 +246,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             rows.append({
                 "lead_id": l["id"],
                 "lead_nome": l.get("lead"),
-                "bdr": SDRS_FOCO[acao["sdr_id"]],
+                "bdr": pessoas.nome_no_dia(SDRS_FOCO[acao["sdr_id"]], acao["data"]),
                 "tipo": acao.get("tipo", "novo"),
                 "data_cadastro": l.get("registerDate"),
                 "data_base": acao["data"],
@@ -293,7 +299,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.subheader("Comissão por BDR")
 
     linhas = []
-    for nome in NOMES_SDRS:
+    for nome in nomes_bdrs:
         d_all = df[df["bdr"] == nome]
         d_ok = elegiveis[elegiveis["bdr"] == nome]
         linhas.append({
@@ -305,8 +311,8 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         })
     resumo = pd.DataFrame(linhas)
 
-    cols = st.columns(3)
-    for i, nome in enumerate(NOMES_SDRS):
+    cols = st.columns(len(nomes_bdrs))
+    for i, nome in enumerate(nomes_bdrs):
         r = resumo[resumo["BDR"] == nome].iloc[0]
         with cols[i]:
             st.markdown(f"#### {nome}")
@@ -323,7 +329,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     if valor_total > 0:
         fig = px.bar(
             resumo, x="BDR", y="_valor", color="BDR", text=resumo["_valor"].apply(_brl),
-            title="Valor a pagar por BDR", color_discrete_map=CORES_SDR,
+            title="Valor a pagar por BDR", color_discrete_map=pessoas.cores(CORES_SDR),
             labels={"_valor": "Comissão (R$)"},
         )
         fig.update_layout(showlegend=False)
@@ -361,7 +367,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     with aba_ok:
         filtro = st.multiselect(
-            "Filtrar BDR", options=NOMES_SDRS, default=NOMES_SDRS, key="f_com_ok"
+            "Filtrar BDR", options=nomes_bdrs, default=nomes_bdrs, key="f_com_ok"
         )
         d = elegiveis[elegiveis["bdr"].isin(filtro)]
         st.markdown(

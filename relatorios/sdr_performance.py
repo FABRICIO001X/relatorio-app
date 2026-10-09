@@ -12,6 +12,10 @@ CRITÉRIOS (definidos com usuário em 25/05/2026):
 
 SDR responsável de cada lead: quem fez a primeira transferência (originUserId em transferHistory)
 Foco: IASMIM (436128), CRISLANE (442056), JENNYFER (448464) | Funil 23120
+
+TROCA DE PESSOA (06/10/2026): o login 442056 é da CRISLANE até 18/09/2026 e da
+MELISSA a partir de 19/09/2026 — ver relatorios/pessoas.py. O nome exibido
+segue a data do registro (cadastro do lead ou data real da venda).
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import streamlit as st
 
 from connectors.exact import ExactClient, ExactError
 from db import cache
+from relatorios import pessoas
 
 SDRS_FOCO = {
     436128: "IASMIM",
@@ -240,10 +245,17 @@ def _montar_linha(
     descarte: dict | None = None,
     categoria: str = "",
 ) -> dict:
-    """Monta uma linha do DataFrame a partir de um lead."""
+    """Monta uma linha do DataFrame a partir de um lead.
+
+    O nome do SDR segue a data do registro: cadastro do lead (categoria
+    'cadastrado') ou data real da venda (categoria 'ganho'). É assim que a
+    troca Crislane → Melissa (19/09/2026) cai na pessoa certa.
+    """
     sales = lead.get("salesRep") or {}
     source = lead.get("source") or {}
     descarte = descarte or {}
+    data_ref = lead.get("_data_venda") if categoria == "ganho" else lead.get("registerDate")
+    sdr_nome = pessoas.nome_no_dia(sdr_nome, data_ref)
     return {
         "lead_id": lead.get("id"),
         "lead_nome": lead.get("lead"),
@@ -264,8 +276,9 @@ def _montar_linha(
 # =============================================================
 def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: bool):
     st.markdown("### 👥 Performance dos SDRs")
+    nomes_sdrs = pessoas.nomes_no_periodo(list(SDRS_FOCO.values()), data_inicio, data_fim)
     st.caption(
-        f"IASMIM · CRISLANE · JENNYFER | Funil principal | "
+        f"{' · '.join(nomes_sdrs)} | Funil principal | "
         f"{data_inicio.strftime('%d/%m/%Y')} a {data_fim.strftime('%d/%m/%Y')}"
     )
     with st.expander("ℹ️ Como o relatório conta os leads"):
@@ -286,7 +299,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v8:{data_inicio}:{data_fim}"
+    chave = f"sdr_v9:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -384,8 +397,8 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     # CARDS — uma coluna por SDR
     # =========================================================
-    cols = st.columns(3)
-    for i, (sdr_id, nome) in enumerate(SDRS_FOCO.items()):
+    cols = st.columns(len(nomes_sdrs))
+    for i, nome in enumerate(nomes_sdrs):
         df_sdr = df[df["sdr_responsavel"] == nome]
 
         # Total de leads = cadastrados no período (deduplica)
@@ -430,7 +443,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.caption("Ordenado pela taxa de conversão (ganhos ÷ leads cadastrados no período)")
 
     rank_rows = []
-    for _sid, nome in SDRS_FOCO.items():
+    for nome in nomes_sdrs:
         df_sdr = df[df["sdr_responsavel"] == nome]
         df_cad = df_sdr[df_sdr["categoria"] == "cadastrado"].drop_duplicates("lead_id")
         total_leads = len(df_cad)
@@ -460,9 +473,9 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             title="Taxa de conversão por SDR",
             labels={"_conv": "Conversão (%)"},
             color="SDR",
-            color_discrete_map={
+            color_discrete_map=pessoas.cores({
                 "IASMIM": "#1D9E75", "CRISLANE": "#378ADD", "JENNYFER": "#E5A663",
-            },
+            }),
         )
         fig_rank.update_layout(showlegend=False, height=280)
         st.plotly_chart(fig_rank, use_container_width=True)
@@ -473,7 +486,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # GRÁFICO — comparativo
     # =========================================================
     dados = []
-    for sdr_id, nome in SDRS_FOCO.items():
+    for nome in nomes_sdrs:
         df_sdr = df[df["sdr_responsavel"] == nome]
         df_cadastrados = df_sdr[df_sdr["categoria"] == "cadastrado"].drop_duplicates("lead_id")
         em_andamento = (~df_cadastrados["stage_atual"].isin(
@@ -559,8 +572,8 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     df_view["Categoria"] = df_view["categoria"].map(cat_labels)
 
     filtro_sdr = st.multiselect(
-        "Filtrar por SDR", options=list(SDRS_FOCO.values()),
-        default=list(SDRS_FOCO.values()),
+        "Filtrar por SDR", options=nomes_sdrs,
+        default=nomes_sdrs,
     )
     filtro_status = st.multiselect(
         "Filtrar por status atual",

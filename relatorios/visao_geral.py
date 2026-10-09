@@ -17,7 +17,7 @@ from db import cache
 
 SDRS_3C = {
     "IASMIM": 123722,
-    "CRISLANE": 200133,
+    "MELISSA": 200133,  # era CRISLANE até 18/09/2026 (mesmo login) — ver relatorios/pessoas.py
     "JENNYFER": 223044,
     "DANIELE": 102589,
     "LAIANE": 60516,

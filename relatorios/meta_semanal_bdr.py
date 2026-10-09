@@ -14,6 +14,10 @@ REGRA (definida com o usuário em 16/09/2026):
   e até o dia da apuração. O caminho no meio não importa: o lead pode
   passar por outras etapas antes de virar proposta.
 - Vence a BDR com mais conversões (número absoluto).
+
+TROCA DE PESSOA (06/10/2026): o login 442056 é da CRISLANE até 18/09/2026 e da
+MELISSA a partir de 19/09/2026 — ver relatorios/pessoas.py. O nome segue a data
+em que a visita foi marcada.
 """
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ import streamlit as st
 
 from connectors.exact import ExactClient, ExactError
 from db import cache
+from relatorios import pessoas
 
 BDRS = {
     436128: "IASMIM",
@@ -129,12 +134,13 @@ def _acoes_da_bdr(
         uid = (ev.get("user") or {}).get("id")
         if uid not in BDRS:
             continue
+        bdr = pessoas.nome_no_dia(BDRS[uid], quando)
         if "lead cadastrado" in txt:
-            out.append({"bdr": BDRS[uid], "quando": quando, "tipo": "novo"})
+            out.append({"bdr": bdr, "quando": quando, "tipo": "novo"})
         elif "lead recuperado" in txt:
-            out.append({"bdr": BDRS[uid], "quando": quando, "tipo": "recuperado"})
+            out.append({"bdr": bdr, "quando": quando, "tipo": "recuperado"})
         elif "lead transferido" in txt:
-            out.append({"bdr": BDRS[uid], "quando": quando, "tipo": "transferido"})
+            out.append({"bdr": bdr, "quando": quando, "tipo": "transferido"})
     return out
 
 
@@ -220,7 +226,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"meta_semanal_v3:{segunda}:{corte.date()}"
+    chave = f"meta_semanal_v4:{segunda}:{corte.date()}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -294,8 +300,9 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     # Placar
     # =========================================================
+    nomes_bdrs = pessoas.nomes_no_periodo(NOMES_BDRS, segunda, segunda + timedelta(days=4))
     placar = []
-    for nome in NOMES_BDRS:
+    for nome in nomes_bdrs:
         d = df[df["bdr"] == nome]
         conv = int(d["converteu"].sum())
         marcadas = len(d)
@@ -333,7 +340,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             f"{int(lider['_conv'])} cada"
         )
 
-    cols = st.columns(3)
+    cols = st.columns(len(df_placar))
     for i, row in df_placar.iterrows():
         with cols[i]:
             medalha = MEDALHAS[i] if i < 3 else ""
@@ -359,7 +366,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             df_placar, x="BDR", y="_conv", color="BDR", text="_conv",
             title="Visitas que viraram proposta",
             labels={"_conv": "Convertidas"},
-            color_discrete_map=CORES,
+            color_discrete_map=pessoas.cores(CORES),
         )
         fig.update_layout(showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
@@ -372,7 +379,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.subheader("Detalhamento das visitas")
 
     filtro = st.multiselect(
-        "Filtrar BDR", options=NOMES_BDRS, default=NOMES_BDRS, key="f_meta"
+        "Filtrar BDR", options=nomes_bdrs, default=nomes_bdrs, key="f_meta"
     )
     so_conv = st.checkbox("Mostrar só as que viraram proposta", value=False)
 

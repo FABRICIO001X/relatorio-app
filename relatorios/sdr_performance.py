@@ -300,7 +300,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"sdr_v10:{data_inicio}:{data_fim}"
+    chave = f"sdr_v11:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:

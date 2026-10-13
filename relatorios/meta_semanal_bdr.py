@@ -227,7 +227,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"meta_semanal_v5:{segunda}:{corte.date()}"
+    chave = f"meta_semanal_v6:{segunda}:{corte.date()}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:

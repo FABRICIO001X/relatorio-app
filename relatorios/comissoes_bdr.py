@@ -29,8 +29,9 @@ from relatorios import pessoas
 
 SDRS_FOCO = {
     436128: "IASMIM",
-    442056: "CRISLANE",
+    442056: "CRISLANE",   # vira MELISSA a partir de 19/09/2026 (relatorios/pessoas.py)
     448464: "JENNYFER",
+    451379: "MELISSA",    # login próprio da Melissa (MELISSA TEIXEIRA), 11/10/2026
 }
 NOMES_SDRS = list(SDRS_FOCO.values())
 
@@ -216,7 +217,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"comissoes_bdr_v3:{data_inicio}:{data_fim}"
+    chave = f"comissoes_bdr_v4:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:

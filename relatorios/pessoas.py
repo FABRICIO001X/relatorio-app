@@ -17,6 +17,10 @@ Cada relatório usa a data que faz sentido para ele:
 - Comissões BDR:     a data da ação do BDR no lead (quem agiu recebe)
 - Meta semanal BDR:  a data em que a visita foi marcada
 
+LOGIN PRÓPRIO (11/10/2026): a Melissa ganhou usuário próprio no Exact (451379,
+MELISSA TEIXEIRA) e o da Crislane (442056) foi desativado. Os dois logins
+aparecem como MELISSA a partir de 19/09/2026 e os números se somam.
+
 Para adicionar outra troca no futuro, basta incluir mais uma linha em TROCAS.
 """
 from __future__ import annotations
@@ -26,6 +30,12 @@ from datetime import date, datetime
 # login (nome antigo) -> lista de (data_inicio, nome_novo), em ordem crescente
 TROCAS: dict[str, list[tuple[date, str]]] = {
     "CRISLANE": [(date(2026, 9, 19), "MELISSA")],
+}
+
+# Pessoas que só existem a partir de uma data (login próprio criado depois).
+# Antes dessa data elas não aparecem nos relatórios.
+INICIO: dict[str, date] = {
+    "MELISSA": date(2026, 9, 19),
 }
 
 # Cores dos novos nomes (os antigos continuam com as cores que cada relatório já usa)
@@ -74,14 +84,19 @@ def nomes_no_periodo(nomes_login: list[str], data_inicio: date, data_fim: date) 
     for nome in nomes_login:
         trocas = TROCAS.get(nome)
         if not trocas:
-            saida.append(nome)
-            continue
-        # nome vigente no início do período
-        vistos = [nome_no_dia(nome, data_inicio)]
-        for inicio, novo in trocas:
-            if data_inicio < inicio <= data_fim and novo not in vistos:
-                vistos.append(novo)
-        saida.extend(vistos)
+            candidatos = [nome]
+        else:
+            # nome vigente no início do período
+            candidatos = [nome_no_dia(nome, data_inicio)]
+            for inicio, novo in trocas:
+                if data_inicio < inicio <= data_fim and novo not in candidatos:
+                    candidatos.append(novo)
+        for c in candidatos:
+            ini = INICIO.get(c)
+            if ini and data_fim < ini:
+                continue  # pessoa ainda não estava na equipe nesse período
+            if c not in saida:
+                saida.append(c)
     return saida
 
 

@@ -26,6 +26,7 @@ import streamlit as st
 from connectors.exact import ExactClient, ExactError
 from db import cache
 from relatorios import pessoas
+from relatorios.links import COLUNA_LINK, adicionar_coluna_link, config_link
 
 SDRS_FOCO = {
     436128: "IASMIM",
@@ -355,10 +356,13 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             {"novo": "🆕 Cadastrou", "recuperado": "♻️ Recuperou",
              "transferido": "↔️ Qualificou"}
         ).fillna("🆕 Cadastrou")
-        return v[[
-            "bdr", "lead_nome", "Tipo", "Cadastrado", "Ação do BDR",
-            "Fechado", "dias_ate_fechar",
-        ]].rename(
+        colunas = ["bdr", "lead_nome"]
+        if adicionar_coluna_link(v):
+            colunas.append(COLUNA_LINK)
+        colunas += [
+            "Tipo", "Cadastrado", "Ação do BDR", "Fechado", "dias_ate_fechar",
+        ]
+        return v[colunas].rename(
             columns={
                 "bdr": "BDR",
                 "lead_nome": "Lead",
@@ -377,7 +381,12 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         if d.empty:
             st.info("Nenhuma venda elegível para os BDRs selecionados.")
         else:
-            st.dataframe(montar_tabela(d), use_container_width=True, hide_index=True)
+            st.dataframe(
+                montar_tabela(d),
+                use_container_width=True,
+                hide_index=True,
+                column_config=config_link(),
+            )
             st.download_button(
                 "📥 Baixar CSV",
                 montar_tabela(d).to_csv(index=False).encode("utf-8-sig"),
@@ -394,7 +403,10 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             st.success("Nenhuma venda ficou fora da janela.")
         else:
             st.dataframe(
-                montar_tabela(fora), use_container_width=True, hide_index=True
+                montar_tabela(fora),
+                use_container_width=True,
+                hide_index=True,
+                column_config=config_link(),
             )
             st.download_button(
                 "📥 Baixar CSV",

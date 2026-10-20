@@ -23,6 +23,7 @@ import streamlit as st
 
 from connectors.exact import ExactClient, ExactError
 from db import cache
+from relatorios.links import COLUNA_LINK, adicionar_coluna_link, config_link
 
 
 CONSULTORAS = {
@@ -482,13 +483,23 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
                 st.info("Nenhuma proposta da(s) consultora(s) selecionada(s).")
             else:
                 df_v["Data entrou em proposta"] = pd.to_datetime(df_v["data_entrou"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
-                df_v = df_v[["Data entrou em proposta", "consultora", "lead_nome", "origem", "status_atual"]].rename(columns={
+                tem_link = adicionar_coluna_link(df_v)
+                colunas = ["Data entrou em proposta", "consultora", "lead_nome"]
+                if tem_link:
+                    colunas.append(COLUNA_LINK)
+                colunas += ["origem", "status_atual"]
+                df_v = df_v[colunas].rename(columns={
                     "consultora": "Consultora",
                     "lead_nome": "Lead",
                     "origem": "Origem (etapa anterior)",
                     "status_atual": "Status atual",
                 }).sort_values("Data entrou em proposta", ascending=False)
-                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    df_v,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=config_link() if tem_link else None,
+                )
                 baixar_csv(df_prop[df_prop["consultora"].isin(filtro_p)], "propostas")
 
     with aba_ganho:
@@ -508,12 +519,22 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             else:
                 df_v["Data ganho"] = pd.to_datetime(df_v["data_ganho"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
                 df_v["Cadastrado"] = pd.to_datetime(df_v["data_cadastro"], errors="coerce").dt.strftime("%d/%m/%Y")
-                df_v = df_v[["Data ganho", "consultora", "lead_nome", "Cadastrado", "dias_ate_fechar"]].rename(columns={
+                tem_link = adicionar_coluna_link(df_v)
+                colunas = ["Data ganho", "consultora", "lead_nome"]
+                if tem_link:
+                    colunas.append(COLUNA_LINK)
+                colunas += ["Cadastrado", "dias_ate_fechar"]
+                df_v = df_v[colunas].rename(columns={
                     "consultora": "Consultora",
                     "lead_nome": "Lead",
                     "dias_ate_fechar": "Dias até fechar",
                 }).sort_values("Data ganho", ascending=False)
-                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    df_v,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=config_link() if tem_link else None,
+                )
                 baixar_csv(df_ganhos[df_ganhos["consultora"].isin(filtro_g)], "ganhos")
 
     with aba_bdr:
@@ -533,12 +554,22 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
             else:
                 df_v["Cadastrado"] = pd.to_datetime(df_v["data_cadastro"], errors="coerce").dt.strftime("%d/%m/%Y")
                 df_v["Última atualização"] = pd.to_datetime(df_v["data_update"], errors="coerce").dt.strftime("%d/%m/%Y")
-                df_v = df_v[["consultora", "lead_nome", "Cadastrado", "Última atualização", "dias_parado"]].rename(columns={
+                tem_link = adicionar_coluna_link(df_v)
+                colunas = ["consultora", "lead_nome"]
+                if tem_link:
+                    colunas.append(COLUNA_LINK)
+                colunas += ["Cadastrado", "Última atualização", "dias_parado"]
+                df_v = df_v[colunas].rename(columns={
                     "consultora": "Consultora",
                     "lead_nome": "Lead",
                     "dias_parado": "Dias parado",
                 }).sort_values("Dias parado", ascending=False)
-                st.dataframe(df_v, use_container_width=True, hide_index=True)
+                st.dataframe(
+                    df_v,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=config_link() if tem_link else None,
+                )
                 baixar_csv(df_bdr[df_bdr["consultora"].isin(filtro_b)], "bdr_atraso")
 
     with aba_tempo:

@@ -24,6 +24,20 @@ class ExactError(Exception):
     pass
 
 
+# URL do Spotter no navegador (diferente da API). Usada para montar o link
+# da ficha do lead nos relatorios.
+EXACT_APP_URL = os.getenv("EXACT_APP_URL", "https://app.exactspotter.com").rstrip("/")
+
+
+def url_lead(lead_id: Any) -> str | None:
+    """Link da ficha do lead no Spotter. None quando o id nao e valido."""
+    try:
+        lid = int(lead_id)
+    except (TypeError, ValueError):
+        return None
+    return f"{EXACT_APP_URL}/spotter/detalhes-lead/{lid}"
+
+
 class ExactClient:
     def __init__(self, token: str | None = None, base_url: str | None = None):
         self.token = token or os.getenv("EXACT_TOKEN")

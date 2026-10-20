@@ -29,6 +29,7 @@ import streamlit as st
 from connectors.exact import ExactClient, ExactError
 from db import cache
 from relatorios import pessoas
+from relatorios.links import COLUNA_LINK, adicionar_coluna_link, config_link
 
 SDRS_FOCO = {
     436128: "IASMIM",
@@ -590,10 +591,12 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     df_filtrado["Cadastro"] = df_filtrado["data_cadastro"].dt.strftime("%d/%m/%Y")
     df_filtrado["Atualização"] = df_filtrado["data_atualizacao"].dt.strftime("%d/%m/%Y")
 
-    colunas = [
-        "Categoria", "Cadastro", "Atualização", "lead_nome", "stage_atual",
-        "sdr_responsavel", "vendedor_atual", "origem",
-    ]
+    tem_link = adicionar_coluna_link(df_filtrado)
+
+    colunas = ["Categoria", "Cadastro", "Atualização", "lead_nome"]
+    if tem_link:
+        colunas.append(COLUNA_LINK)
+    colunas += ["stage_atual", "sdr_responsavel", "vendedor_atual", "origem"]
     if "stage_descarte" in df_filtrado.columns:
         colunas.extend(["stage_descarte", "motivo_descarte"])
 
@@ -609,7 +612,12 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     df_tabela = df_filtrado[colunas].rename(columns=rename).sort_values("Atualização", ascending=False)
 
     st.caption(f"{len(df_tabela)} leads")
-    st.dataframe(df_tabela, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_tabela,
+        use_container_width=True,
+        hide_index=True,
+        column_config=config_link() if tem_link else None,
+    )
 
     csv = df_tabela.to_csv(index=False).encode("utf-8-sig")
     st.download_button(

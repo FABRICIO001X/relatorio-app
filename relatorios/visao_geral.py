@@ -19,6 +19,7 @@ SDRS_3C = {
     "IASMIM": 123722,
     "MELISSA": 200133,  # era CRISLANE até 18/09/2026 (mesmo login) — ver relatorios/pessoas.py
     "JENNYFER": 223044,
+    "MICAELE": 270383,  # Mikaele no 3C Plus, entrou 27/10/2026
     "DANIELE": 102589,
     "LAIANE": 60516,
     "LAYLA": 183640,
@@ -122,7 +123,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     st.markdown("### 📈 Resumo de hoje")
     st.caption(hoje.strftime("%d/%m/%Y"))
 
-    chave = f"visao_geral_v1:{hoje}"
+    chave = f"visao_geral_v2:{hoje}"
     dados = cache.buscar(chave, ttl_segundos=min(ttl_minutos, 15) * 60) if usar_cache else None
 
     if dados is None:

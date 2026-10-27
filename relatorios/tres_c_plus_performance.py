@@ -29,6 +29,7 @@ SDRS_3C_PLUS = {
     "IASMIM": 123722,
     "CRISLANE": 200133,
     "JENNYFER": 223044,
+    "MICAELE": 270383,   # Mikaele no 3C Plus (ramal 877089), entrou 27/10/2026
     "DANIELE": 102589,
     "LAIANE": 60516,
     "LAYLA": 183640,
@@ -61,7 +62,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token 3C Plus não configurado: {e}")
         return
 
-    chave = f"3cplus_qual_v3:{data_inicio}:{data_fim}"
+    chave = f"3cplus_qual_v4:{data_inicio}:{data_fim}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -101,7 +102,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
     # =========================================================
     # ATENDIDAS (contato efetivo) — buscar antes dos cards
     # =========================================================
-    chave_at = f"3cplus_atend_v2:{data_inicio}:{data_fim}"
+    chave_at = f"3cplus_atend_v3:{data_inicio}:{data_fim}"
     df_at = cache.buscar_df(chave_at, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df_at is None:
@@ -128,7 +129,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
 
     # ---------- Números-base por pessoa ----------
     dias_periodo = (data_fim - data_inicio).days + 1
-    BDRS = pessoas.nomes_no_periodo(["IASMIM", "CRISLANE", "JENNYFER"], data_inicio, data_fim)
+    BDRS = pessoas.nomes_no_periodo(["IASMIM", "CRISLANE", "JENNYFER", "MICAELE"], data_inicio, data_fim)
     CONSULTORAS = ["DANIELE", "LAIANE", "LAYLA"]
     RD = "RD STATION"
 

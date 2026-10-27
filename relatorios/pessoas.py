@@ -36,11 +36,13 @@ TROCAS: dict[str, list[tuple[date, str]]] = {
 # Antes dessa data elas não aparecem nos relatórios.
 INICIO: dict[str, date] = {
     "MELISSA": date(2026, 9, 19),
+    "MICAELE": date(2026, 10, 26),  # Micaele Ferreira, Exact 451858
 }
 
 # Cores dos novos nomes (os antigos continuam com as cores que cada relatório já usa)
 CORES_NOVAS = {
     "MELISSA": "#8E44AD",
+    "MICAELE": "#D35400",
 }
 
 

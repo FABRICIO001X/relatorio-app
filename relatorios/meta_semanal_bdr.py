@@ -42,6 +42,13 @@ NOMES_BDRS = list(BDRS.values())
 
 STAGE_PROPOSTA = "PROPOSTA ENVIADA"
 
+# Leads que entram direto no nome do vendedor (sem rastro da BDR na linha do
+# tempo) mas que carregam a ORIGEM da BDR. Só vale para quem está listada aqui.
+# Ex.: o n8n cria o lead na conta da consultora e a Micaele não aparece no histórico.
+ORIGEM_FALLBACK = {
+    "BDR MIKAELE": "MICAELE",
+}
+
 CORES = {
     "IASMIM": "#1D9E75",
     "CRISLANE": "#378ADD",
@@ -114,7 +121,11 @@ def _coletar_leads_com_atividade(
 
 
 def _acoes_da_bdr(
-    cliente: ExactClient, lead_id: int, inicio_iso: str, fim_iso: str
+    cliente: ExactClient,
+    lead_id: int,
+    inicio_iso: str,
+    fim_iso: str,
+    origem: str | None = None,
 ) -> list[dict]:
     """Eventos de VISITA MARCADA pela BDR dentro da janela, pela linha do tempo.
 
@@ -128,6 +139,7 @@ def _acoes_da_bdr(
         return []
     itens = resp.get("value", resp) if isinstance(resp, dict) else resp
     out = []
+    cadastro_sem_bdr = None  # "lead cadastrado" feito por quem não é BDR
     for ev in itens or []:
         quando = ev.get("createdAt") or ""
         if not (inicio_iso <= quando <= fim_iso):
@@ -135,6 +147,8 @@ def _acoes_da_bdr(
         txt = (ev.get("text") or "").lower()
         uid = (ev.get("user") or {}).get("id")
         if uid not in BDRS:
+            if "lead cadastrado" in txt and cadastro_sem_bdr is None:
+                cadastro_sem_bdr = quando
             continue
         bdr = pessoas.nome_no_dia(BDRS[uid], quando)
         if "lead cadastrado" in txt:
@@ -143,6 +157,12 @@ def _acoes_da_bdr(
             out.append({"bdr": bdr, "quando": quando, "tipo": "recuperado"})
         elif "lead transferido" in txt:
             out.append({"bdr": bdr, "quando": quando, "tipo": "transferido"})
+
+    # Fallback pela origem: lead criado direto no nome do vendedor, mas com a
+    # origem da BDR (ex.: "BDR MIKAELE"). Só entra se a BDR ainda não aparece.
+    alvo = ORIGEM_FALLBACK.get((origem or "").strip().upper())
+    if alvo and cadastro_sem_bdr and not any(a["bdr"] == alvo for a in out):
+        out.append({"bdr": alvo, "quando": cadastro_sem_bdr, "tipo": "novo"})
     return out
 
 
@@ -228,7 +248,7 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         st.error(f"Token do Exact não configurado: {e}")
         return
 
-    chave = f"meta_semanal_v7:{segunda}:{corte.date()}"
+    chave = f"meta_semanal_v8:{segunda}:{corte.date()}"
     df = cache.buscar_df(chave, ttl_segundos=ttl_minutos * 60) if usar_cache else None
 
     if df is None:
@@ -248,7 +268,8 @@ def renderizar(data_inicio: date, data_fim: date, ttl_minutos: int, usar_cache: 
         cadastrados: list[tuple[dict, str, str, str]] = []  # (lead, bdr, quando, tipo)
         for i, l in enumerate(leads):
             prog.progress((i + 1) / len(leads))
-            for ac in _acoes_da_bdr(cliente, l["id"], ini_iso, fim_iso):
+            origem_lead = (l.get("source") or {}).get("value")
+            for ac in _acoes_da_bdr(cliente, l["id"], ini_iso, fim_iso, origem_lead):
                 cadastrados.append((l, ac["bdr"], ac["quando"], ac["tipo"]))
         prog.empty()
 
